@@ -6,11 +6,10 @@ use std::path::PathBuf;
 use crate::config::LauncherConfig;
 use crate::download::{DownloadMode, DownloadOptions, DownloadPlan};
 use crate::minecraft::{LaunchProfile, VersionMetadata};
-use crate::platform::{RuntimeEnvironment, UiLayout};
+use crate::platform::{current_platform_defaults, RuntimeEnvironment, UiLayout};
 
 const LAUNCHER_AUTHOR: &str = "Kron4ek";
 const LAUNCHER_VERSION: &str = "1.1.20";
-const DEFAULT_CUSTOM_JVM_ARGS: &str = "-Xss1M -XX:+UnlockExperimentalVMOptions -XX:+UseG1GC -XX:G1NewSizePercent=20 -XX:G1ReservePercent=20 -XX:MaxGCPauseMillis=50 -XX:G1HeapRegionSize=32M";
 
 #[derive(Debug)]
 pub struct LauncherUi {
@@ -178,7 +177,7 @@ impl LauncherUiState {
             .java_path
             .clone()
             .or_else(|| runtime.find_java())
-            .unwrap_or_else(default_java_path);
+            .unwrap_or_else(|| current_platform_defaults().default_java_executable_path);
         Self {
             main: MainWindowState {
                 player_name: profile.username.clone(),
@@ -202,7 +201,7 @@ impl LauncherUiState {
                 custom_java_path: java_path.display().to_string(),
                 use_custom_jvm_parameters: config.use_custom_jvm_parameters,
                 custom_jvm_parameters: if config.extra_jvm_args.is_empty() {
-                    DEFAULT_CUSTOM_JVM_ARGS.to_owned()
+                    current_platform_defaults().default_modern_jvm_arguments
                 } else {
                     config.extra_jvm_args.join(" ")
                 },
@@ -253,12 +252,5 @@ fn disabled(value: bool) -> &'static str {
         " (disabled)"
     } else {
         ""
-    }
-}
-fn default_java_path() -> PathBuf {
-    if cfg!(windows) {
-        PathBuf::from("java.exe")
-    } else {
-        PathBuf::from("/usr/bin/java")
     }
 }
