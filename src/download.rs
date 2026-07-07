@@ -10,7 +10,9 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, SystemTime};
 
-use crate::minecraft::{DownloadInfo, LaunchProfile, LibraryJson, Rule, RuleAction};
+use crate::minecraft::{
+    rules_apply_with_context, DownloadInfo, LaunchContext, LaunchProfile, LibraryJson,
+};
 use serde::Deserialize;
 
 pub const VERSION_MANIFEST_URL: &str =
@@ -398,7 +400,7 @@ pub fn parse_libraries(
     version
         .libraries
         .iter()
-        .filter(|lib| rules_apply(&lib.rules))
+        .filter(|lib| rules_apply_with_context(&lib.rules, &LaunchContext::current()))
         .map(|lib| resolve_library(lib, &libraries_dir))
         .collect()
 }
@@ -837,40 +839,6 @@ fn download_info_job(
         DownloadJob::new(kind, info.url.as_ref()?, dest, label)
             .with_integrity(info.sha1.clone(), info.size),
     )
-}
-fn rules_apply(rules: &[Rule]) -> bool {
-    if rules.is_empty() {
-        return true;
-    }
-    let mut allowed = false;
-    for rule in rules {
-        if os_rule_matches(rule.os.as_ref()) {
-            allowed = rule.action == RuleAction::Allow;
-        }
-    }
-    allowed
-}
-fn os_rule_matches(rule: Option<&crate::minecraft::OsRule>) -> bool {
-    let Some(rule) = rule else {
-        return true;
-    };
-    rule.name
-        .as_deref()
-        .map(|n| n == current_minecraft_os_name())
-        .unwrap_or(true)
-        && rule
-            .arch
-            .as_deref()
-            .map(|a| a == std::env::consts::ARCH)
-            .unwrap_or(true)
-}
-fn current_minecraft_os_name() -> &'static str {
-    match std::env::consts::OS {
-        "windows" => "windows",
-        "macos" => "osx",
-        "linux" => "linux",
-        _ => "unknown",
-    }
 }
 fn minecraft_native_classifier() -> &'static str {
     match std::env::consts::OS {

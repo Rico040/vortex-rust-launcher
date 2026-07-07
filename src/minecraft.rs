@@ -48,6 +48,53 @@ pub struct LaunchCommand {
     pub launch_string: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LaunchContext {
+    pub os: String,
+    pub arch: String,
+    pub demo_mode: bool,
+    pub resolution: Option<(u32, u32)>,
+    pub quick_play_support: bool,
+    pub quick_play_singleplayer: bool,
+    pub quick_play_multiplayer: bool,
+    pub quick_play_realms: bool,
+    pub custom_features: BTreeMap<String, bool>,
+}
+
+impl Default for LaunchContext {
+    fn default() -> Self {
+        Self::current()
+    }
+}
+
+impl LaunchContext {
+    pub fn current() -> Self {
+        Self {
+            os: current_minecraft_os_name().to_owned(),
+            arch: std::env::consts::ARCH.to_owned(),
+            demo_mode: false,
+            resolution: None,
+            quick_play_support: false,
+            quick_play_singleplayer: false,
+            quick_play_multiplayer: false,
+            quick_play_realms: false,
+            custom_features: BTreeMap::new(),
+        }
+    }
+
+    fn feature_enabled(&self, feature: &str) -> bool {
+        match feature {
+            "is_demo_user" => self.demo_mode,
+            "has_custom_resolution" => self.resolution.is_some(),
+            "has_quick_plays_support" => self.quick_play_support,
+            "is_quick_play_singleplayer" => self.quick_play_singleplayer,
+            "is_quick_play_multiplayer" => self.quick_play_multiplayer,
+            "is_quick_play_realms" => self.quick_play_realms,
+            feature => self.custom_features.get(feature).copied().unwrap_or(false),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MinecraftVersionJson {
@@ -227,10 +274,18 @@ impl MinecraftVersionJson {
     }
 
     pub fn effective_libraries(&self, game_directory: impl AsRef<Path>) -> Vec<Library> {
+        self.effective_libraries_with_context(game_directory, &LaunchContext::current())
+    }
+
+    pub fn effective_libraries_with_context(
+        &self,
+        game_directory: impl AsRef<Path>,
+        context: &LaunchContext,
+    ) -> Vec<Library> {
         let libraries_dir = game_directory.as_ref().join("libraries");
         self.libraries
             .iter()
-            .filter(|lib| rules_apply(&lib.rules))
+            .filter(|lib| rules_apply_with_context(&lib.rules, context))
             .map(|lib| {
                 let path = lib
                     .downloads
@@ -258,6 +313,19 @@ impl MinecraftVersionJson {
         profile: &LaunchProfile,
         save_launch_string: bool,
     ) -> LaunchCommand {
+        self.build_launch_command_with_context(
+            profile,
+            save_launch_string,
+            &LaunchContext::current(),
+        )
+    }
+
+    pub fn build_launch_command_with_context(
+        &self,
+        profile: &LaunchProfile,
+        save_launch_string: bool,
+        context: &LaunchContext,
+    ) -> LaunchCommand {
         let java = profile
             .java_path
             .clone()
@@ -270,7 +338,7 @@ impl MinecraftVersionJson {
             .join(jar_id)
             .join(format!("{jar_id}.jar"));
         let classpath = build_classpath(
-            self.effective_libraries(&profile.game_directory),
+            self.effective_libraries_with_context(&profile.game_directory, context),
             &version_jar,
         );
         let natives_dir = profile
@@ -315,11 +383,15 @@ impl MinecraftVersionJson {
                 .to_string(),
         );
         replacements.insert("classpath_separator", classpath_separator().to_owned());
+        if let Some((width, height)) = context.resolution {
+            replacements.insert("resolution_width", width.to_string());
+            replacements.insert("resolution_height", height.to_string());
+        }
 
         let mut args = vec![format!("-Xmx{}M", profile.memory_mb)];
         args.extend(profile.jvm_args.clone());
         if let Some(arguments) = &self.arguments {
-            args.extend(expand_arguments(&arguments.jvm, &replacements));
+            args.extend(expand_arguments(&arguments.jvm, &replacements, context));
         } else {
             args.extend(
                 [
@@ -340,7 +412,7 @@ impl MinecraftVersionJson {
             args.push(main_class);
         }
         if let Some(arguments) = &self.arguments {
-            args.extend(expand_arguments(&arguments.game, &replacements));
+            args.extend(expand_arguments(&arguments.game, &replacements, context));
         } else if let Some(legacy) = &self.minecraft_arguments {
             args.extend(
                 legacy
@@ -416,12 +488,13 @@ pub fn version_json_path(game_directory: impl AsRef<Path>, version: &str) -> Pat
 fn expand_arguments(
     values: &[ArgumentValue],
     replacements: &BTreeMap<&str, String>,
+    context: &LaunchContext,
 ) -> Vec<String> {
     values
         .iter()
         .filter(|value| match value {
             ArgumentValue::String(_) => true,
-            ArgumentValue::Ruled { rules, .. } => rules_apply(rules),
+            ArgumentValue::Ruled { rules, .. } => rules_apply_with_context(rules, context),
         })
         .flat_map(|value| match value {
             ArgumentValue::String(value) => vec![replace_placeholders(value, replacements)],
@@ -445,35 +518,39 @@ fn replace_placeholders(value: &str, replacements: &BTreeMap<&str, String>) -> S
 }
 
 fn rules_apply(rules: &[Rule]) -> bool {
+    rules_apply_with_context(rules, &LaunchContext::current())
+}
+
+pub(crate) fn rules_apply_with_context(rules: &[Rule], context: &LaunchContext) -> bool {
     if rules.is_empty() {
         return true;
     }
     let mut allowed = false;
     for rule in rules {
-        if os_rule_matches(rule.os.as_ref()) && features_match(&rule.features) {
+        if os_rule_matches(rule.os.as_ref(), context) && features_match(&rule.features, context) {
             allowed = rule.action == RuleAction::Allow;
         }
     }
     allowed
 }
 
-fn features_match(features: &BTreeMap<String, bool>) -> bool {
-    // Launcher-controlled optional Minecraft features (demo mode, quick play,
-    // custom resolution) default to disabled until the UI exposes them.
-    features.values().all(|enabled| !enabled)
+fn features_match(features: &BTreeMap<String, bool>, context: &LaunchContext) -> bool {
+    features
+        .iter()
+        .all(|(feature, expected)| context.feature_enabled(feature) == *expected)
 }
 
-fn os_rule_matches(rule: Option<&OsRule>) -> bool {
+fn os_rule_matches(rule: Option<&OsRule>, context: &LaunchContext) -> bool {
     let Some(rule) = rule else {
         return true;
     };
     if let Some(name) = &rule.name {
-        if name != current_minecraft_os_name() {
+        if name != &context.os {
             return false;
         }
     }
     if let Some(arch) = &rule.arch {
-        if arch != std::env::consts::ARCH {
+        if arch != &context.arch {
             return false;
         }
     }
@@ -542,5 +619,104 @@ fn quote_arg(value: &str) -> String {
         value.to_owned()
     } else {
         format!("\"{}\"", value.replace('"', "\\\""))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn linux_context() -> LaunchContext {
+        LaunchContext {
+            os: "linux".to_owned(),
+            arch: "x86_64".to_owned(),
+            demo_mode: false,
+            resolution: None,
+            quick_play_support: false,
+            quick_play_singleplayer: false,
+            quick_play_multiplayer: false,
+            quick_play_realms: false,
+            custom_features: BTreeMap::new(),
+        }
+    }
+
+    fn profile() -> LaunchProfile {
+        LaunchProfile {
+            username: "Player".to_owned(),
+            version_id: "1.20.4".to_owned(),
+            game_directory: PathBuf::from(".minecraft"),
+            java_path: None,
+            memory_mb: 2048,
+            jvm_args: Vec::new(),
+            game_args: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn modern_version_json_expands_representative_argument_rules() {
+        let version: MinecraftVersionJson = serde_json::from_str(
+            r#"{
+                "id": "1.20.4",
+                "mainClass": "net.minecraft.client.main.Main",
+                "assetIndex": { "id": "12", "url": "https://example/assets.json" },
+                "arguments": {
+                    "jvm": [
+                        "-Djava.library.path=${natives_directory}",
+                        { "rules": [{ "action": "allow", "os": { "name": "linux" } }], "value": "-XstartOnLinux" },
+                        { "rules": [{ "action": "allow", "features": { "has_custom_resolution": true } }], "value": ["--width", "${resolution_width}"] }
+                    ],
+                    "game": [
+                        "--username", "${auth_player_name}",
+                        { "rules": [{ "action": "allow", "features": { "is_demo_user": true } }], "value": "--demo" }
+                    ]
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let command =
+            version.build_launch_command_with_context(&profile(), false, &linux_context());
+
+        assert!(command.args.contains(&"-XstartOnLinux".to_owned()));
+        assert!(command.args.contains(&"--username".to_owned()));
+        assert!(!command.args.contains(&"--demo".to_owned()));
+        assert!(!command.args.contains(&"--width".to_owned()));
+    }
+
+    #[test]
+    fn rule_denial_overrides_previous_allow() {
+        let rules: Vec<Rule> = serde_json::from_str(
+            r#"[
+                { "action": "allow" },
+                { "action": "disallow", "os": { "name": "linux" } }
+            ]"#,
+        )
+        .unwrap();
+
+        assert!(!rules_apply_with_context(&rules, &linux_context()));
+    }
+
+    #[test]
+    fn os_specific_allow_matches_launch_context() {
+        let rules: Vec<Rule> =
+            serde_json::from_str(r#"[{ "action": "allow", "os": { "name": "osx" } }]"#).unwrap();
+        let mut context = linux_context();
+        assert!(!rules_apply_with_context(&rules, &context));
+
+        context.os = "osx".to_owned();
+        assert!(rules_apply_with_context(&rules, &context));
+    }
+
+    #[test]
+    fn feature_specific_allow_uses_launch_context() {
+        let rules: Vec<Rule> = serde_json::from_str(
+            r#"[{ "action": "allow", "features": { "is_demo_user": true } }]"#,
+        )
+        .unwrap();
+        let mut context = linux_context();
+        assert!(!rules_apply_with_context(&rules, &context));
+
+        context.demo_mode = true;
+        assert!(rules_apply_with_context(&rules, &context));
     }
 }
