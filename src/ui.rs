@@ -1,9 +1,9 @@
 // Vortex Minecraft Launcher - Rust scaffold
 // SPDX-License-Identifier: GPL-3.0-only
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
-use crate::config::LauncherConfig;
+use crate::config::{LauncherConfig, DEFAULT_CONFIG_FILE};
 use crate::download::{DownloadMode, DownloadOptions, DownloadPlan};
 use crate::minecraft::{LaunchProfile, VersionMetadata};
 use crate::platform::{current_platform_defaults, RuntimeEnvironment, UiLayout};
@@ -16,6 +16,8 @@ pub struct LauncherUi {
     runtime: RuntimeEnvironment,
     layout: UiLayout,
     state: LauncherUiState,
+    config: LauncherConfig,
+    config_path: PathBuf,
     download_plan: DownloadPlan,
 }
 
@@ -71,11 +73,13 @@ impl LauncherUi {
             runtime,
             layout,
             state,
+            config,
+            config_path: PathBuf::from(DEFAULT_CONFIG_FILE),
             download_plan,
         }
     }
 
-    pub fn run(&self) {
+    pub fn run(&mut self) {
         // The current crate intentionally keeps the GUI backend swappable while the
         // launcher logic is ported.  This renderer mirrors the PureBasic windows and
         // callbacks as a deterministic text presentation, so the non-UI modules own
@@ -90,6 +94,48 @@ impl LauncherUi {
         if self.state.settings.open {
             println!("\n{}", self.render_settings_window());
         }
+        if let Err(error) = self.save_config() {
+            eprintln!("Failed to save launcher configuration: {error}");
+        }
+    }
+
+    pub fn save_config(&mut self) -> std::io::Result<()> {
+        self.apply_state_to_config();
+        self.config.save(&self.config_path)
+    }
+
+    pub fn save_config_to(&mut self, path: impl AsRef<Path>) -> std::io::Result<()> {
+        self.apply_state_to_config();
+        self.config.save(path)
+    }
+
+    fn apply_state_to_config(&mut self) {
+        self.config.username = non_empty(self.state.main.player_name.replace(' ', ""));
+        self.config.selected_version = non_empty(self.state.main.selected_version.replace(' ', ""));
+        self.config.memory_mb = self.state.main.ram_mb.parse::<u32>().ok();
+        self.config.download_missing_libraries = self.state.settings.download_missing_libraries;
+        self.config.async_download = self.state.settings.async_download;
+        self.config.download_threads = self
+            .state
+            .settings
+            .download_threads
+            .parse()
+            .unwrap_or(self.config.download_threads);
+        self.config.use_custom_java = self.state.settings.use_custom_java;
+        self.config.java_path =
+            non_empty(self.state.settings.custom_java_path.clone()).map(PathBuf::from);
+        self.config.use_custom_jvm_parameters = self.state.settings.use_custom_jvm_parameters;
+        self.config.extra_jvm_args = self
+            .state
+            .settings
+            .custom_jvm_parameters
+            .split_whitespace()
+            .map(ToOwned::to_owned)
+            .collect();
+        self.config.save_launch_string = self.state.settings.save_launch_string;
+        self.config.keep_launcher_open = self.state.settings.keep_launcher_open;
+        self.config.show_all_versions = self.state.downloader.show_all_versions;
+        self.config.redownload_all_files = self.state.downloader.redownload_all_files;
     }
 
     pub fn render_main_window(&self) -> String {
@@ -253,4 +299,8 @@ fn disabled(value: bool) -> &'static str {
     } else {
         ""
     }
+}
+
+fn non_empty(value: String) -> Option<String> {
+    (!value.is_empty()).then_some(value)
 }
