@@ -7,6 +7,7 @@
 
 mod config;
 mod download;
+mod launch;
 mod minecraft;
 mod platform;
 mod ui;
