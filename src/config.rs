@@ -7,6 +7,8 @@ use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
+use crate::platform::current_platform_defaults;
+
 pub const DEFAULT_CONFIG_FILE: &str = "vortex_launcher.conf";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -31,19 +33,21 @@ pub struct LauncherConfig {
 
 impl Default for LauncherConfig {
     fn default() -> Self {
+        let platform_defaults = current_platform_defaults();
+
         Self {
             username: None,
             game_directory: None,
             java_path: None,
             selected_version: None,
-            memory_mb: None,
+            memory_mb: Some(platform_defaults.default_ram_mb),
             extra_jvm_args: Vec::new(),
             extra_game_args: Vec::new(),
-            download_missing_libraries: true,
+            download_missing_libraries: platform_defaults.default_download_missing_libraries,
             redownload_all_files: false,
             show_all_versions: false,
-            download_threads: 20,
-            async_download: true,
+            download_threads: platform_defaults.default_download_threads,
+            async_download: platform_defaults.default_async_download,
             use_custom_java: false,
             use_custom_jvm_parameters: false,
             save_launch_string: false,
