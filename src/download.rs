@@ -6,7 +6,6 @@ use std::collections::{BTreeMap, VecDeque};
 use std::fs;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, SystemTime};
@@ -121,6 +120,50 @@ pub enum DownloadEvent {
 pub struct DownloadSummary {
     pub succeeded: usize,
     pub failed: usize,
+}
+
+#[derive(Debug)]
+pub enum DownloadError {
+    Io(io::Error),
+    HttpStatus { url: String, status: u16 },
+    Network { url: String, message: String },
+    SizeMismatch { expected: u64, actual: u64 },
+    Sha1Mismatch { expected: String, actual: String },
+}
+
+impl std::fmt::Display for DownloadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Io(error) => write!(f, "{error}"),
+            Self::HttpStatus { url, status } => {
+                write!(f, "HTTP request to {url} failed with status {status}")
+            }
+            Self::Network { url, message } => {
+                write!(f, "network request to {url} failed: {message}")
+            }
+            Self::SizeMismatch { expected, actual } => {
+                write!(f, "size mismatch: expected {expected}, got {actual}")
+            }
+            Self::Sha1Mismatch { expected, actual } => {
+                write!(f, "sha1 mismatch: expected {expected}, got {actual}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for DownloadError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Io(error) => Some(error),
+            _ => None,
+        }
+    }
+}
+
+impl From<io::Error> for DownloadError {
+    fn from(error: io::Error) -> Self {
+        Self::Io(error)
+    }
 }
 
 impl DownloadJob {
@@ -559,64 +602,88 @@ fn download_one(
     job: &DownloadJob,
     index: usize,
     sender: &mpsc::Sender<DownloadEvent>,
-) -> io::Result<()> {
+) -> Result<(), DownloadError> {
     if let Some(parent) = job.destination.parent() {
         fs::create_dir_all(parent)?;
     }
 
     let tmp = job.destination.with_extension("download");
-    let mut bytes = Vec::new();
+    let mut file = fs::File::create(&tmp)?;
+    let mut downloaded = 0_u64;
+    let total = job.expected_size;
+
     if let Some(path) = job.url.strip_prefix("file://") {
         let mut input = fs::File::open(path)?;
-        let mut file = fs::File::create(&tmp)?;
-        input.read_to_end(&mut bytes)?;
-        file.write_all(&bytes)?;
+        stream_to_file(&mut input, &mut file, &mut downloaded, index, total, sender)?;
     } else {
-        let status = Command::new("curl")
-            .args([
-                "--fail",
-                "--location",
-                "--silent",
-                "--show-error",
-                "--output",
-            ])
-            .arg(&tmp)
-            .arg(&job.url)
-            .status()?;
-        if !status.success() {
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
-                format!("curl exited with status {status}"),
-            ));
-        }
-        fs::File::open(&tmp)?.read_to_end(&mut bytes)?;
+        let response = ureq::get(&job.url).call().map_err(|error| match error {
+            ureq::Error::Status(status, _) => DownloadError::HttpStatus {
+                url: job.url.clone(),
+                status,
+            },
+            ureq::Error::Transport(error) => DownloadError::Network {
+                url: job.url.clone(),
+                message: error.to_string(),
+            },
+        })?;
+        let total = response
+            .header("content-length")
+            .and_then(|value| value.parse::<u64>().ok())
+            .or(job.expected_size);
+        let mut input = response.into_reader();
+        stream_to_file(&mut input, &mut file, &mut downloaded, index, total, sender)?;
     }
-    let downloaded = bytes.len() as u64;
-    let _ = sender.send(DownloadEvent::JobProgress {
-        index,
-        downloaded,
-        total: job.expected_size,
-    });
+    file.sync_all()?;
 
     if let Some(expected) = job.expected_size {
         if downloaded != expected {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("size mismatch: expected {expected}, got {downloaded}"),
-            ));
+            return Err(DownloadError::SizeMismatch {
+                expected,
+                actual: downloaded,
+            });
         }
     }
     if let Some(expected) = &job.expected_sha1 {
-        let actual = sha1_hex(&bytes);
+        let actual = sha1_hex_file(&tmp)?;
         if !expected.eq_ignore_ascii_case(&actual) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("sha1 mismatch: expected {expected}, got {actual}"),
-            ));
+            return Err(DownloadError::Sha1Mismatch {
+                expected: expected.clone(),
+                actual,
+            });
         }
     }
     fs::rename(tmp, &job.destination)?;
     Ok(())
+}
+
+fn stream_to_file(
+    input: &mut dyn Read,
+    output: &mut fs::File,
+    downloaded: &mut u64,
+    index: usize,
+    total: Option<u64>,
+    sender: &mpsc::Sender<DownloadEvent>,
+) -> io::Result<()> {
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = input.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        output.write_all(&buffer[..read])?;
+        *downloaded += read as u64;
+        let _ = sender.send(DownloadEvent::JobProgress {
+            index,
+            downloaded: *downloaded,
+            total,
+        });
+    }
+    Ok(())
+}
+
+fn sha1_hex_file(path: &Path) -> io::Result<String> {
+    let bytes = fs::read(path)?;
+    Ok(sha1_hex(&bytes))
 }
 
 fn sha1_hex(data: &[u8]) -> String {
@@ -915,5 +982,46 @@ mod tests {
     #[test]
     fn bundled_sha1_matches_known_vector() {
         assert_eq!(sha1_hex(b"abc"), "a9993e364706816aba3e25717850c26c9cd0d89d");
+    }
+
+    #[test]
+    fn download_streams_file_url_with_progress_and_atomic_destination() {
+        let root = std::env::temp_dir().join(format!(
+            "vortex-download-test-{}",
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let source = root.join("source.bin");
+        let destination = root.join("nested/destination.bin");
+        fs::write(&source, b"abc").unwrap();
+        let (tx, rx) = mpsc::channel();
+        let job = DownloadJob::new(
+            DownloadKind::Asset,
+            format!("file://{}", source.display()),
+            destination.clone(),
+            "local test asset",
+        )
+        .with_integrity(
+            Some("a9993e364706816aba3e25717850c26c9cd0d89d".to_owned()),
+            Some(3),
+        );
+
+        download_one(&job, 7, &tx).unwrap();
+
+        assert_eq!(fs::read(&destination).unwrap(), b"abc");
+        assert!(!destination.with_extension("download").exists());
+        assert!(rx.try_iter().any(|event| {
+            event
+                == DownloadEvent::JobProgress {
+                    index: 7,
+                    downloaded: 3,
+                    total: Some(3),
+                }
+        }));
+
+        let _ = fs::remove_dir_all(root);
     }
 }
