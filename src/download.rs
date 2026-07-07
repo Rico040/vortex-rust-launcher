@@ -611,10 +611,19 @@ fn download_one(
     let mut file = fs::File::create(&tmp)?;
     let mut downloaded = 0_u64;
     let total = job.expected_size;
+    let mut sha1 = Sha1::new();
 
     if let Some(path) = job.url.strip_prefix("file://") {
         let mut input = fs::File::open(path)?;
-        stream_to_file(&mut input, &mut file, &mut downloaded, index, total, sender)?;
+        stream_to_file(
+            &mut input,
+            &mut file,
+            &mut downloaded,
+            &mut sha1,
+            index,
+            total,
+            sender,
+        )?;
     } else {
         let response = ureq::get(&job.url).call().map_err(|error| match error {
             ureq::Error::Status(status, _) => DownloadError::HttpStatus {
@@ -631,7 +640,15 @@ fn download_one(
             .and_then(|value| value.parse::<u64>().ok())
             .or(job.expected_size);
         let mut input = response.into_reader();
-        stream_to_file(&mut input, &mut file, &mut downloaded, index, total, sender)?;
+        stream_to_file(
+            &mut input,
+            &mut file,
+            &mut downloaded,
+            &mut sha1,
+            index,
+            total,
+            sender,
+        )?;
     }
     file.sync_all()?;
 
@@ -644,7 +661,7 @@ fn download_one(
         }
     }
     if let Some(expected) = &job.expected_sha1 {
-        let actual = sha1_hex_file(&tmp)?;
+        let actual = sha1.finalize_hex();
         if !expected.eq_ignore_ascii_case(&actual) {
             return Err(DownloadError::Sha1Mismatch {
                 expected: expected.clone(),
@@ -660,6 +677,7 @@ fn stream_to_file(
     input: &mut dyn Read,
     output: &mut fs::File,
     downloaded: &mut u64,
+    sha1: &mut Sha1,
     index: usize,
     total: Option<u64>,
     sender: &mpsc::Sender<DownloadEvent>,
@@ -670,6 +688,7 @@ fn stream_to_file(
         if read == 0 {
             break;
         }
+        sha1.update(&buffer[..read]);
         output.write_all(&buffer[..read])?;
         *downloaded += read as u64;
         let _ = sender.send(DownloadEvent::JobProgress {
@@ -682,25 +701,92 @@ fn stream_to_file(
 }
 
 fn sha1_hex_file(path: &Path) -> io::Result<String> {
-    let bytes = fs::read(path)?;
-    Ok(sha1_hex(&bytes))
+    let mut file = fs::File::open(path)?;
+    let mut sha1 = Sha1::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        sha1.update(&buffer[..read]);
+    }
+    Ok(sha1.finalize_hex())
 }
 
 fn sha1_hex(data: &[u8]) -> String {
-    let mut h0: u32 = 0x67452301;
-    let mut h1: u32 = 0xefcdab89;
-    let mut h2: u32 = 0x98badcfe;
-    let mut h3: u32 = 0x10325476;
-    let mut h4: u32 = 0xc3d2e1f0;
-    let bit_len = (data.len() as u64) * 8;
-    let mut msg = data.to_vec();
-    msg.push(0x80);
-    while (msg.len() % 64) != 56 {
-        msg.push(0);
-    }
-    msg.extend_from_slice(&bit_len.to_be_bytes());
+    let mut sha1 = Sha1::new();
+    sha1.update(data);
+    sha1.finalize_hex()
+}
 
-    for chunk in msg.chunks(64) {
+#[derive(Debug, Clone)]
+struct Sha1 {
+    h0: u32,
+    h1: u32,
+    h2: u32,
+    h3: u32,
+    h4: u32,
+    len_bytes: u64,
+    buffer: Vec<u8>,
+}
+
+impl Sha1 {
+    fn new() -> Self {
+        Self {
+            h0: 0x67452301,
+            h1: 0xefcdab89,
+            h2: 0x98badcfe,
+            h3: 0x10325476,
+            h4: 0xc3d2e1f0,
+            len_bytes: 0,
+            buffer: Vec::with_capacity(64),
+        }
+    }
+
+    fn update(&mut self, data: &[u8]) {
+        self.len_bytes = self.len_bytes.wrapping_add(data.len() as u64);
+        let mut input = data;
+        if !self.buffer.is_empty() {
+            let needed = 64 - self.buffer.len();
+            let take = needed.min(input.len());
+            self.buffer.extend_from_slice(&input[..take]);
+            input = &input[take..];
+            if self.buffer.len() == 64 {
+                let chunk = self.buffer.clone();
+                self.process_chunk(&chunk);
+                self.buffer.clear();
+            }
+        }
+        let mut chunks = input.chunks_exact(64);
+        for chunk in chunks.by_ref() {
+            self.process_chunk(chunk);
+        }
+        let remainder = chunks.remainder();
+        if !remainder.is_empty() {
+            self.buffer.extend_from_slice(remainder);
+        }
+    }
+
+    fn finalize_hex(mut self) -> String {
+        let bit_len = self.len_bytes.wrapping_mul(8);
+        self.buffer.push(0x80);
+        while (self.buffer.len() % 64) != 56 {
+            self.buffer.push(0);
+        }
+        self.buffer.extend_from_slice(&bit_len.to_be_bytes());
+        let buffer = std::mem::take(&mut self.buffer);
+        for chunk in buffer.chunks(64) {
+            self.process_chunk(chunk);
+        }
+        format!(
+            "{:08x}{:08x}{:08x}{:08x}{:08x}",
+            self.h0, self.h1, self.h2, self.h3, self.h4
+        )
+    }
+
+    fn process_chunk(&mut self, chunk: &[u8]) {
+        debug_assert_eq!(chunk.len(), 64);
         let mut w = [0_u32; 80];
         for (i, word) in w.iter_mut().take(16).enumerate() {
             *word = u32::from_be_bytes([
@@ -713,7 +799,7 @@ fn sha1_hex(data: &[u8]) -> String {
         for i in 16..80 {
             w[i] = (w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16]).rotate_left(1);
         }
-        let (mut a, mut b, mut c, mut d, mut e) = (h0, h1, h2, h3, h4);
+        let (mut a, mut b, mut c, mut d, mut e) = (self.h0, self.h1, self.h2, self.h3, self.h4);
         for (i, word) in w.iter().enumerate() {
             let (f, k) = match i {
                 0..=19 => ((b & c) | ((!b) & d), 0x5a827999),
@@ -733,13 +819,12 @@ fn sha1_hex(data: &[u8]) -> String {
             b = a;
             a = temp;
         }
-        h0 = h0.wrapping_add(a);
-        h1 = h1.wrapping_add(b);
-        h2 = h2.wrapping_add(c);
-        h3 = h3.wrapping_add(d);
-        h4 = h4.wrapping_add(e);
+        self.h0 = self.h0.wrapping_add(a);
+        self.h1 = self.h1.wrapping_add(b);
+        self.h2 = self.h2.wrapping_add(c);
+        self.h3 = self.h3.wrapping_add(d);
+        self.h4 = self.h4.wrapping_add(e);
     }
-    format!("{h0:08x}{h1:08x}{h2:08x}{h3:08x}{h4:08x}")
 }
 
 fn download_info_job(
@@ -820,16 +905,19 @@ fn ensure_slash(value: &str) -> String {
     }
 }
 fn existing_file_is_valid(job: &DownloadJob) -> bool {
-    let Ok(bytes) = fs::read(&job.destination) else {
+    let Ok(metadata) = job.destination.metadata() else {
         return false;
     };
     if let Some(expected_size) = job.expected_size {
-        if bytes.len() as u64 != expected_size {
+        if metadata.len() != expected_size {
             return false;
         }
     }
     if let Some(expected_sha1) = &job.expected_sha1 {
-        if !expected_sha1.eq_ignore_ascii_case(&sha1_hex(&bytes)) {
+        let Ok(actual_sha1) = sha1_hex_file(&job.destination) else {
+            return false;
+        };
+        if !expected_sha1.eq_ignore_ascii_case(&actual_sha1) {
             return false;
         }
     }
@@ -1021,6 +1109,44 @@ mod tests {
                     total: Some(3),
                 }
         }));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn large_file_download_emits_progress_for_each_chunk() {
+        let root = std::env::temp_dir().join(format!(
+            "vortex-large-download-test-{}",
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let source = root.join("source.bin");
+        let destination = root.join("nested/destination.bin");
+        let bytes = vec![42_u8; (64 * 1024) + 17];
+        fs::write(&source, &bytes).unwrap();
+        let (tx, rx) = mpsc::channel();
+        let job = DownloadJob::new(
+            DownloadKind::Asset,
+            format!("file://{}", source.display()),
+            destination.clone(),
+            "large local test asset",
+        )
+        .with_integrity(Some(sha1_hex(&bytes)), Some(bytes.len() as u64));
+
+        download_one(&job, 3, &tx).unwrap();
+
+        let progress = rx
+            .try_iter()
+            .filter_map(|event| match event {
+                DownloadEvent::JobProgress { downloaded, .. } => Some(downloaded),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(fs::read(&destination).unwrap(), bytes);
+        assert_eq!(progress, vec![64 * 1024, (64 * 1024) + 17]);
 
         let _ = fs::remove_dir_all(root);
     }
