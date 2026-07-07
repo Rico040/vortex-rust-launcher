@@ -57,10 +57,9 @@ fn run() -> io::Result<()> {
             let runtime = platform::RuntimeEnvironment::detect();
             let profile = minecraft::LaunchProfile::from_config(&config);
             let download_plan = download::DownloadPlan::for_profile(&profile);
-            let mut ui = ui::LauncherUi::new(runtime, config, profile, download_plan);
-            ui.run();
-            print_help();
-            Ok(())
+            let ui = ui::LauncherUi::new(runtime, config, profile, download_plan);
+            ui.run()
+                .map_err(|error| io::Error::other(error.to_string()))
         }
     }
 }

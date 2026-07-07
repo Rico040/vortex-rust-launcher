@@ -3,8 +3,11 @@
 
 use std::path::{Path, PathBuf};
 
+use eframe::egui;
+
 use crate::config::{LauncherConfig, DEFAULT_CONFIG_FILE};
 use crate::download::{DownloadMode, DownloadOptions, DownloadPlan};
+use crate::launch::{self, LaunchOptions};
 use crate::minecraft::{LaunchProfile, VersionMetadata};
 use crate::platform::{current_platform_defaults, RuntimeEnvironment, UiLayout};
 
@@ -79,31 +82,28 @@ impl LauncherUi {
         }
     }
 
-    pub fn run(&mut self) {
-        // The current crate intentionally keeps the GUI backend swappable while the
-        // launcher logic is ported.  This renderer mirrors the PureBasic windows and
-        // callbacks as a deterministic text presentation, so the non-UI modules own
-        // config persistence, download planning, Java lookup, and launch arguments.
-        println!("{}", self.render_main_window());
-        println!("Queued download tasks: {}", self.download_queue_len());
-        println!("Download options: {:?}", self.downloader_options());
-        println!("Launch preview args: {:?}", self.play());
-        if self.state.downloader.open {
-            println!("\n{}", self.render_downloader_window());
-        }
-        if self.state.settings.open {
-            println!("\n{}", self.render_settings_window());
-        }
-        if let Err(error) = self.save_config() {
-            eprintln!("Failed to save launcher configuration: {error}");
-        }
+    pub fn run(self) -> eframe::Result<()> {
+        let size = egui::vec2(
+            self.layout.main_window.0 as f32,
+            self.layout.main_window.1 as f32,
+        );
+        let options = eframe::NativeOptions {
+            viewport: egui::ViewportBuilder::default()
+                .with_inner_size(size)
+                .with_min_inner_size(size),
+            ..Default::default()
+        };
+        eframe::run_native(
+            "Vortex Minecraft Launcher",
+            options,
+            Box::new(|_cc| Ok(Box::new(LauncherApp { ui: self }))),
+        )
     }
 
     pub fn save_config(&mut self) -> std::io::Result<()> {
         self.apply_state_to_config();
         self.config.save(&self.config_path)
     }
-
     pub fn save_config_to(&mut self, path: impl AsRef<Path>) -> std::io::Result<()> {
         self.apply_state_to_config();
         self.config.save(path)
@@ -138,57 +138,69 @@ impl LauncherUi {
         self.config.redownload_all_files = self.state.downloader.redownload_all_files;
     }
 
-    pub fn render_main_window(&self) -> String {
-        format!(
-            "Vortex Minecraft Launcher ({:?}, {}x{})\nPlayer name: [{}]\nRAM (MB): [{}]\nMinecraft version: [{}]\n[Play]\n[Downloader]\n[Settings]\nby {}                                                    v{}\n{}",
-            self.runtime.os,
-            self.layout.main_window.0,
-            self.layout.main_window.1,
-            self.state.main.player_name,
-            self.state.main.ram_mb,
-            self.state.main.selected_version,
-            LAUNCHER_AUTHOR,
-            LAUNCHER_VERSION,
-            self.state.status_message,
-        )
+    fn handle_play(&mut self) {
+        self.apply_state_to_config();
+        let profile = self.state.to_launch_profile(&self.runtime);
+        match profile
+            .launch_command(self.config.save_launch_string)
+            .and_then(|command| {
+                let outcome = launch::launch_minecraft(
+                    &command,
+                    LaunchOptions {
+                        keep_launcher_open: self.config.keep_launcher_open,
+                        save_launch_string: self.config.save_launch_string,
+                    },
+                )?;
+                if let Some(display) = outcome.display_command {
+                    std::fs::write("launch_string.txt", display)?;
+                }
+                Ok(outcome.child.id())
+            }) {
+            Ok(pid) => self.state.status_message = format!("Launched Minecraft with pid {pid}"),
+            Err(error) => self.state.status_message = format!("Launch failed: {error}"),
+        }
     }
 
-    pub fn render_downloader_window(&self) -> String {
-        format!(
-            "Client Downloader ({}x{})\nVersion: [{}]\n[{}] Show all versions\n[{}] Redownload all files\n[Download]",
-            self.layout.downloader_window.0,
-            self.layout.downloader_window.1,
-            self.state.downloader.selected_version,
-            checkbox(self.state.downloader.show_all_versions),
-            checkbox(self.state.downloader.redownload_all_files),
-        )
+    fn handle_download(&mut self) {
+        self.state.main.selected_version = self.state.downloader.selected_version.clone();
+        self.apply_state_to_config();
+        if let Err(error) = self.save_config() {
+            self.state.status_message = format!("Could not save download settings: {error}");
+            return;
+        }
+
+        match std::env::current_exe().and_then(|exe| {
+            std::process::Command::new(exe)
+                .arg("download")
+                .arg(&self.state.main.selected_version)
+                .spawn()
+        }) {
+            Ok(child) => {
+                self.state.status_message = format!(
+                    "Started download process {} for {} with {:?}.",
+                    child.id(),
+                    self.state.main.selected_version,
+                    self.downloader_options()
+                );
+            }
+            Err(error) => self.state.status_message = format!("Download failed to start: {error}"),
+        }
     }
 
-    pub fn render_settings_window(&self) -> String {
-        format!(
-            "Vortex Launcher Settings ({}x{})\nLaunch parameters: [{}]{}\nPath to Java binary: [{}]{}\nDownload threads: [{}]{}\n[{}] Fast multithreaded downloading\n[{}] Download missing libraries on game start\n[{}] Save the launch string to a file\n[{}] Use custom Java\n[{}] Use custom launch parameters\n[{}] Keep the launcher open\n[Save and apply]",
-            self.layout.settings_window.0,
-            self.layout.settings_window.1,
-            self.state.settings.custom_jvm_parameters,
-            disabled(!self.state.settings.use_custom_jvm_parameters),
-            self.state.settings.custom_java_path,
-            disabled(!self.state.settings.use_custom_java),
-            self.state.settings.download_threads,
-            disabled(!self.state.settings.async_download),
-            checkbox(self.state.settings.async_download),
-            checkbox(self.state.settings.download_missing_libraries),
-            checkbox(self.state.settings.save_launch_string),
-            checkbox(self.state.settings.use_custom_java),
-            checkbox(self.state.settings.use_custom_jvm_parameters),
-            checkbox(self.state.settings.keep_launcher_open),
-        )
+    fn handle_save(&mut self) {
+        match self.save_config() {
+            Ok(()) => {
+                self.state.status_message =
+                    format!("Saved settings to {}", self.config_path.display())
+            }
+            Err(error) => self.state.status_message = format!("Save failed: {error}"),
+        }
     }
 
     pub fn play(&self) -> Vec<String> {
         let profile = self.state.to_launch_profile(&self.runtime);
         profile.launch_arguments(&VersionMetadata::minimal(&profile.version_id))
     }
-
     pub fn downloader_options(&self) -> DownloadOptions {
         DownloadOptions {
             mode: if self.state.downloader.redownload_all_files {
@@ -201,9 +213,139 @@ impl LauncherUi {
             async_download: self.state.settings.async_download,
         }
     }
-
     pub fn download_queue_len(&self) -> usize {
         self.download_plan.tasks.len()
+    }
+}
+
+struct LauncherApp {
+    ui: LauncherUi,
+}
+
+impl eframe::App for LauncherApp {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        egui::CentralPanel::default().show(ctx, |ui| {
+            ui.heading("Vortex Minecraft Launcher");
+            ui.horizontal(|ui| {
+                ui.label("Player name:");
+                ui.text_edit_singleline(&mut self.ui.state.main.player_name);
+            });
+            ui.horizontal(|ui| {
+                ui.label("RAM (MB):");
+                ui.text_edit_singleline(&mut self.ui.state.main.ram_mb);
+            });
+            ui.horizontal(|ui| {
+                ui.label("Minecraft version:");
+                egui::ComboBox::from_id_source("version")
+                    .selected_text(&self.ui.state.main.selected_version)
+                    .show_ui(ui, |ui| {
+                        for version in &self.ui.state.main.installed_versions {
+                            ui.selectable_value(
+                                &mut self.ui.state.main.selected_version,
+                                version.clone(),
+                                version,
+                            );
+                        }
+                    });
+                ui.text_edit_singleline(&mut self.ui.state.main.selected_version);
+            });
+            ui.horizontal(|ui| {
+                if ui.button("Play").clicked() {
+                    self.ui.handle_play();
+                }
+                if ui.button("Downloader").clicked() {
+                    self.ui.state.downloader.open = true;
+                }
+                if ui.button("Settings").clicked() {
+                    self.ui.state.settings.open = true;
+                }
+            });
+            ui.separator();
+            ui.label(&self.ui.state.status_message);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.label(format!("by {LAUNCHER_AUTHOR} v{LAUNCHER_VERSION}"))
+            });
+        });
+
+        let mut downloader_open = self.ui.state.downloader.open;
+        egui::Window::new("Client Downloader")
+            .open(&mut downloader_open)
+            .default_size([
+                self.ui.layout.downloader_window.0 as f32,
+                self.ui.layout.downloader_window.1 as f32,
+            ])
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label("Version:");
+                    ui.text_edit_singleline(&mut self.ui.state.downloader.selected_version);
+                });
+                ui.checkbox(
+                    &mut self.ui.state.downloader.show_all_versions,
+                    "Show all versions",
+                );
+                ui.checkbox(
+                    &mut self.ui.state.downloader.redownload_all_files,
+                    "Redownload all files",
+                );
+                if ui.button("Download").clicked() {
+                    self.ui.handle_download();
+                }
+            });
+        self.ui.state.downloader.open = downloader_open;
+
+        let mut settings_open = self.ui.state.settings.open;
+        egui::Window::new("Vortex Launcher Settings")
+            .open(&mut settings_open)
+            .default_size([
+                self.ui.layout.settings_window.0 as f32,
+                self.ui.layout.settings_window.1 as f32,
+            ])
+            .show(ctx, |ui| {
+                ui.checkbox(
+                    &mut self.ui.state.settings.async_download,
+                    "Fast multithreaded downloading",
+                );
+                ui.add_enabled_ui(self.ui.state.settings.async_download, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label("Download threads:");
+                        ui.text_edit_singleline(&mut self.ui.state.settings.download_threads);
+                    });
+                });
+                ui.checkbox(
+                    &mut self.ui.state.settings.download_missing_libraries,
+                    "Download missing libraries on game start",
+                );
+                ui.checkbox(
+                    &mut self.ui.state.settings.save_launch_string,
+                    "Save the launch string to a file",
+                );
+                ui.checkbox(
+                    &mut self.ui.state.settings.use_custom_java,
+                    "Use custom Java",
+                );
+                ui.add_enabled_ui(self.ui.state.settings.use_custom_java, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label("Path to Java binary:");
+                        ui.text_edit_singleline(&mut self.ui.state.settings.custom_java_path);
+                    });
+                });
+                ui.checkbox(
+                    &mut self.ui.state.settings.use_custom_jvm_parameters,
+                    "Use custom launch parameters",
+                );
+                ui.add_enabled_ui(self.ui.state.settings.use_custom_jvm_parameters, |ui| {
+                    ui.label("Launch parameters:");
+                    ui.text_edit_multiline(&mut self.ui.state.settings.custom_jvm_parameters);
+                });
+                ui.checkbox(
+                    &mut self.ui.state.settings.keep_launcher_open,
+                    "Keep the launcher open",
+                );
+                if ui.button("Save and apply").clicked() {
+                    self.ui.handle_save();
+                }
+            });
+        self.ui.state.settings.open = settings_open;
     }
 }
 
@@ -283,21 +425,6 @@ impl LauncherUiState {
                 .unwrap_or_default(),
             game_args: Vec::new(),
         }
-    }
-}
-
-fn checkbox(value: bool) -> &'static str {
-    if value {
-        "x"
-    } else {
-        " "
-    }
-}
-fn disabled(value: bool) -> &'static str {
-    if value {
-        " (disabled)"
-    } else {
-        ""
     }
 }
 
