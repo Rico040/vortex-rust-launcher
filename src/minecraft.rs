@@ -32,6 +32,17 @@ pub struct LaunchProfile {
     pub game_args: Vec<String>,
 }
 
+impl VersionMetadata {
+    pub fn minimal(id: &str) -> Self {
+        Self {
+            id: id.to_owned(),
+            main_class: None,
+            libraries: Vec::new(),
+            assets_index: None,
+        }
+    }
+}
+
 impl LaunchProfile {
     pub fn from_config(config: &LauncherConfig) -> Self {
         Self {

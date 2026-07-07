@@ -27,6 +27,20 @@ pub struct DownloadPlan {
     pub max_parallel_downloads: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DownloadMode {
+    MissingLibraries,
+    AllFiles,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DownloadOptions {
+    pub mode: DownloadMode,
+    pub include_snapshots: bool,
+    pub max_parallel_downloads: usize,
+    pub async_download: bool,
+}
+
 impl DownloadPlan {
     pub fn for_profile(profile: &LaunchProfile) -> Self {
         Self {
