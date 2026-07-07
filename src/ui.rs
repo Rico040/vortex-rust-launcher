@@ -138,9 +138,9 @@ impl LauncherUi {
         self.config.redownload_all_files = self.state.downloader.redownload_all_files;
     }
 
-    fn handle_play(&mut self) {
+    fn handle_play(&mut self) -> bool {
         self.apply_state_to_config();
-        let profile = self.state.to_launch_profile(&self.runtime);
+        let profile = LaunchProfile::from_config(&self.config);
         match profile
             .launch_command(self.config.save_launch_string)
             .and_then(|command| {
@@ -154,10 +154,16 @@ impl LauncherUi {
                 if let Some(display) = outcome.display_command {
                     std::fs::write("launch_string.txt", display)?;
                 }
-                Ok(outcome.child.id())
+                Ok((outcome.child.id(), outcome.should_close_launcher))
             }) {
-            Ok(pid) => self.state.status_message = format!("Launched Minecraft with pid {pid}"),
-            Err(error) => self.state.status_message = format!("Launch failed: {error}"),
+            Ok((pid, should_close_launcher)) => {
+                self.state.status_message = format!("Launched Minecraft with pid {pid}");
+                should_close_launcher
+            }
+            Err(error) => {
+                self.state.status_message = format!("Launch failed: {error}");
+                false
+            }
         }
     }
 
@@ -250,8 +256,8 @@ impl eframe::App for LauncherApp {
                 ui.text_edit_singleline(&mut self.ui.state.main.selected_version);
             });
             ui.horizontal(|ui| {
-                if ui.button("Play").clicked() {
-                    self.ui.handle_play();
+                if ui.button("Play").clicked() && self.ui.handle_play() {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                 }
                 if ui.button("Downloader").clicked() {
                     self.ui.state.downloader.open = true;
