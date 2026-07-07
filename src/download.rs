@@ -436,24 +436,25 @@ fn resolve_library(lib: &LibraryJson, libraries_dir: &Path) -> ResolvedLibrary {
             artifact_info.and_then(|a| a.size),
         ),
     );
-    let native_classifier = minecraft_native_classifier();
-    let native = lib
-        .downloads
-        .as_ref()
-        .and_then(|d| d.classifiers.as_ref())
-        .and_then(|c| c.get(native_classifier))
-        .and_then(|info| {
-            let path = info
-                .path
-                .clone()
-                .unwrap_or_else(|| classifier_path(&lib.name, native_classifier));
-            download_info_job(
-                DownloadKind::NativeLibrary,
-                info,
-                libraries_dir.join(path),
-                format!("{} {native_classifier}", lib.name),
-            )
-        });
+    let native_classifier = native_classifier_for_library(lib);
+    let native = native_classifier.as_deref().and_then(|native_classifier| {
+        lib.downloads
+            .as_ref()
+            .and_then(|d| d.classifiers.as_ref())
+            .and_then(|c| c.get(native_classifier))
+            .and_then(|info| {
+                let path = info
+                    .path
+                    .clone()
+                    .unwrap_or_else(|| classifier_path(&lib.name, native_classifier));
+                download_info_job(
+                    DownloadKind::NativeLibrary,
+                    info,
+                    libraries_dir.join(path),
+                    format!("{} {native_classifier}", lib.name),
+                )
+            })
+    });
     ResolvedLibrary {
         name: lib.name.clone(),
         classpath_path: Some(libraries_dir.join(artifact_path)),
@@ -846,6 +847,24 @@ fn minecraft_native_classifier() -> &'static str {
         "macos" => "natives-osx",
         "linux" => "natives-linux",
         _ => "natives-linux",
+    }
+}
+fn native_classifier_for_library(lib: &LibraryJson) -> Option<String> {
+    if let Some(natives) = &lib.natives {
+        let os = match std::env::consts::OS {
+            "macos" => "osx",
+            other => other,
+        };
+        natives.get(os).map(|classifier| {
+            let bits = if std::env::consts::ARCH.contains("64") {
+                "64"
+            } else {
+                "32"
+            };
+            classifier.replace("${arch}", bits)
+        })
+    } else {
+        Some(minecraft_native_classifier().to_owned())
     }
 }
 fn maven_path(name: &str) -> String {
