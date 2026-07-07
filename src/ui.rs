@@ -1,6 +1,7 @@
 // Vortex Minecraft Launcher
 // SPDX-License-Identifier: GPL-3.0-only
 
+use std::fs;
 use std::path::{Path, PathBuf};
 
 use eframe::egui;
@@ -38,6 +39,7 @@ pub struct MainWindowState {
     pub ram_mb: String,
     pub selected_version: String,
     pub installed_versions: Vec<String>,
+    pub versions_error: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -242,21 +244,33 @@ impl eframe::App for LauncherApp {
             });
             ui.horizontal(|ui| {
                 ui.label("Minecraft version:");
-                egui::ComboBox::from_id_source("version")
-                    .selected_text(&self.ui.state.main.selected_version)
-                    .show_ui(ui, |ui| {
-                        for version in &self.ui.state.main.installed_versions {
-                            ui.selectable_value(
-                                &mut self.ui.state.main.selected_version,
-                                version.clone(),
-                                version,
-                            );
-                        }
-                    });
-                ui.text_edit_singleline(&mut self.ui.state.main.selected_version);
+                if self.ui.state.main.installed_versions.is_empty() {
+                    ui.label("No installed versions");
+                } else {
+                    egui::ComboBox::from_id_source("version")
+                        .selected_text(&self.ui.state.main.selected_version)
+                        .show_ui(ui, |ui| {
+                            for version in &self.ui.state.main.installed_versions {
+                                ui.selectable_value(
+                                    &mut self.ui.state.main.selected_version,
+                                    version.clone(),
+                                    version,
+                                );
+                            }
+                        });
+                    ui.text_edit_singleline(&mut self.ui.state.main.selected_version);
+                }
             });
+            if let Some(error) = &self.ui.state.main.versions_error {
+                ui.colored_label(egui::Color32::YELLOW, error);
+            }
             ui.horizontal(|ui| {
-                if ui.button("Play").clicked() && self.ui.handle_play() {
+                let can_play = !self.ui.state.main.installed_versions.is_empty();
+                if ui
+                    .add_enabled(can_play, egui::Button::new("Play"))
+                    .clicked()
+                    && self.ui.handle_play()
+                {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                 }
                 if ui.button("Downloader").clicked() {
@@ -361,12 +375,34 @@ impl LauncherUiState {
         profile: &LaunchProfile,
         runtime: &RuntimeEnvironment,
     ) -> Self {
-        let installed_versions = config
+        let (installed_versions, versions_error) = installed_versions(&profile.game_directory)
+            .map_or_else(
+                |error| {
+                    (
+                        Vec::new(),
+                        Some(format!(
+                            "Could not read {}: {error}. Open Downloader to install a version.",
+                            profile.game_directory.join("versions").display()
+                        )),
+                    )
+                },
+                |versions| {
+                    let versions_error = versions.is_empty().then(|| {
+                        format!(
+                            "No installed versions found in {}. Open Downloader to install one.",
+                            profile.game_directory.join("versions").display()
+                        )
+                    });
+                    (versions, versions_error)
+                },
+            );
+        let selected_version = config
             .selected_version
-            .clone()
-            .into_iter()
-            .chain([profile.version_id.clone()])
-            .collect();
+            .as_ref()
+            .filter(|chosen| installed_versions.iter().any(|version| version == *chosen))
+            .cloned()
+            .or_else(|| installed_versions.first().cloned())
+            .unwrap_or_else(|| profile.version_id.clone());
         let java_path = config
             .java_path
             .clone()
@@ -376,12 +412,13 @@ impl LauncherUiState {
             main: MainWindowState {
                 player_name: profile.username.clone(),
                 ram_mb: profile.memory_mb.to_string(),
-                selected_version: profile.version_id.clone(),
+                selected_version: selected_version.clone(),
                 installed_versions,
+                versions_error,
             },
             downloader: DownloaderWindowState {
                 open: false,
-                selected_version: profile.version_id.clone(),
+                selected_version,
                 show_all_versions: config.show_all_versions,
                 redownload_all_files: config.redownload_all_files,
                 available_versions: vec![profile.version_id.clone()],
@@ -436,4 +473,105 @@ impl LauncherUiState {
 
 fn non_empty(value: String) -> Option<String> {
     (!value.is_empty()).then_some(value)
+}
+
+fn installed_versions(game_directory: &Path) -> std::io::Result<Vec<String>> {
+    let versions_directory = game_directory.join("versions");
+    let mut versions = Vec::new();
+
+    if !versions_directory.exists() {
+        return Ok(versions);
+    }
+
+    for entry in fs::read_dir(&versions_directory)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let version = entry.file_name().to_string_lossy().into_owned();
+        if entry.path().join(format!("{version}.json")).is_file() {
+            versions.push(version);
+        }
+    }
+
+    versions.sort_by(|left, right| {
+        left.to_ascii_lowercase()
+            .cmp(&right.to_ascii_lowercase())
+            .then_with(|| left.cmp(right))
+    });
+    Ok(versions)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_game_dir() -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "vortex-ui-test-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
+
+    #[test]
+    fn scans_only_version_directories_with_matching_json() {
+        let root = temp_game_dir();
+        fs::create_dir_all(root.join("versions/1.20.4")).unwrap();
+        fs::write(root.join("versions/1.20.4/1.20.4.json"), "{}").unwrap();
+        fs::create_dir_all(root.join("versions/1.19.4")).unwrap();
+        fs::write(root.join("versions/1.19.4/wrong.json"), "{}").unwrap();
+        fs::write(root.join("versions/readme.txt"), "ignored").unwrap();
+
+        assert_eq!(installed_versions(&root).unwrap(), vec!["1.20.4"]);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn prefers_configured_chosen_version_when_installed() {
+        let root = temp_game_dir();
+        for version in ["1.20.4", "1.21"] {
+            fs::create_dir_all(root.join("versions").join(version)).unwrap();
+            fs::write(
+                root.join("versions")
+                    .join(version)
+                    .join(format!("{version}.json")),
+                "{}",
+            )
+            .unwrap();
+        }
+        let mut config = LauncherConfig::default();
+        config.selected_version = Some("1.21".to_owned());
+        let mut profile = LaunchProfile::from_config(&config);
+        profile.game_directory = root.clone();
+
+        let state = LauncherUiState::from_config(&config, &profile, &RuntimeEnvironment::detect());
+
+        assert_eq!(state.main.installed_versions, vec!["1.20.4", "1.21"]);
+        assert_eq!(state.main.selected_version, "1.21");
+        assert!(state.main.versions_error.is_none());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn surfaces_empty_state_when_no_versions_are_installed() {
+        let root = temp_game_dir();
+        fs::create_dir_all(root.join("versions")).unwrap();
+        let config = LauncherConfig::default();
+        let mut profile = LaunchProfile::from_config(&config);
+        profile.game_directory = root.clone();
+
+        let state = LauncherUiState::from_config(&config, &profile, &RuntimeEnvironment::detect());
+
+        assert!(state.main.installed_versions.is_empty());
+        assert!(state
+            .main
+            .versions_error
+            .unwrap()
+            .contains("Open Downloader"));
+        fs::remove_dir_all(root).unwrap();
+    }
 }
