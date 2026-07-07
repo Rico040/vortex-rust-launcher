@@ -1,4 +1,4 @@
-// Vortex Minecraft Launcher - Rust scaffold
+// Vortex Minecraft Launcher
 // SPDX-License-Identifier: GPL-3.0-only
 #![allow(dead_code)]
 
@@ -75,6 +75,10 @@ impl LauncherConfig {
 
     pub fn load_from(path: impl AsRef<Path>) -> io::Result<Self> {
         Self::load(path)
+    }
+
+    pub fn save_default(&self) -> io::Result<()> {
+        self.save(DEFAULT_CONFIG_FILE)
     }
 
     pub fn save(&self, path: impl AsRef<Path>) -> io::Result<()> {
