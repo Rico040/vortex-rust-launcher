@@ -18,6 +18,13 @@ pub struct RuntimeEnvironment {
     pub home_dir: Option<PathBuf>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UiLayout {
+    pub main_window: (u32, u32),
+    pub downloader_window: (u32, u32),
+    pub settings_window: (u32, u32),
+}
+
 impl RuntimeEnvironment {
     pub fn detect() -> Self {
         Self {
@@ -39,6 +46,26 @@ impl RuntimeEnvironment {
                 .join("Application Support")
                 .join("minecraft"),
         })
+    }
+
+    pub fn ui_layout(&self) -> UiLayout {
+        match self.os {
+            OperatingSystem::Windows => UiLayout {
+                main_window: (350, 255),
+                downloader_window: (200, 120),
+                settings_window: (335, 255),
+            },
+            OperatingSystem::Linux | OperatingSystem::Other => UiLayout {
+                main_window: (350, 280),
+                downloader_window: (300, 160),
+                settings_window: (350, 315),
+            },
+            OperatingSystem::MacOs => UiLayout {
+                main_window: (350, 245),
+                downloader_window: (250, 140),
+                settings_window: (350, 315),
+            },
+        }
     }
 
     pub fn find_java(&self) -> Option<PathBuf> {
