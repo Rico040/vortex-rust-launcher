@@ -1006,7 +1006,7 @@ mod tests {
                 r#"{{
                 "id":"1.0",
                 "downloads":{{"client":{{"url":"https://example/client.jar","sha1":"a9993e364706816aba3e25717850c26c9cd0d89d","size":3}}}},
-                "libraries":[{{"name":"org.example:lib:1.0","downloads":{{"artifact":{{"path":"org/example/lib/1.0/lib-1.0.jar","url":"https://example/lib.jar","sha1":"a9993e364706816aba3e25717850c26c9cd0d89d","size":3}},"classifiers":{{"{native_classifier}":{{"path":"org/example/lib/1.0/lib-1.0-{native_classifier}.jar","url":"https://example/native.jar"}}}}}}}}}],
+                "libraries":[{{"name":"org.example:lib:1.0","downloads":{{"artifact":{{"path":"org/example/lib/1.0/lib-1.0.jar","url":"https://example/lib.jar","sha1":"a9993e364706816aba3e25717850c26c9cd0d89d","size":3}},"classifiers":{{"{native_classifier}":{{"path":"org/example/lib/1.0/lib-1.0-{native_classifier}.jar","url":"https://example/native.jar"}}}}}}}}}}],
                 "assetIndex":{{"id":"1","url":"https://example/assets.json"}},
                 "logging":{{"client":{{"file":{{"url":"https://example/log.xml"}}}}}}
             }}"#
