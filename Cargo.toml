@@ -7,3 +7,5 @@ description = "Rust scaffold for the Vortex Minecraft Launcher"
 repository = "https://github.com/Kron4ek/minecraft-vortex-launcher"
 
 [dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
