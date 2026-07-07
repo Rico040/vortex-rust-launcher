@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 
 use eframe::egui;
 
-use crate::config::{LauncherConfig, DEFAULT_CONFIG_FILE};
+use crate::config::{join_args, parse_arg_string, LauncherConfig, DEFAULT_CONFIG_FILE};
 use crate::download::{DownloadMode, DownloadOptions, DownloadPlan};
 use crate::launch::{self, LaunchOptions};
 use crate::minecraft::{LaunchProfile, VersionMetadata};
@@ -173,12 +173,7 @@ impl LauncherUi {
         config.use_custom_java = state.settings.use_custom_java;
         config.java_path = non_empty(state.settings.custom_java_path.clone()).map(PathBuf::from);
         config.use_custom_jvm_parameters = state.settings.use_custom_jvm_parameters;
-        config.extra_jvm_args = state
-            .settings
-            .custom_jvm_parameters
-            .split_whitespace()
-            .map(ToOwned::to_owned)
-            .collect();
+        config.extra_jvm_args = parse_arg_string(&state.settings.custom_jvm_parameters);
         config.save_launch_string = state.settings.save_launch_string;
         config.keep_launcher_open = state.settings.keep_launcher_open;
         config.show_all_versions = state.downloader.show_all_versions;
@@ -500,7 +495,7 @@ impl LauncherUiState {
                 custom_jvm_parameters: if config.extra_jvm_args.is_empty() {
                     current_platform_defaults().default_modern_jvm_arguments
                 } else {
-                    config.extra_jvm_args.join(" ")
+                    join_args(&config.extra_jvm_args)
                 },
                 save_launch_string: config.save_launch_string,
                 keep_launcher_open: config.keep_launcher_open,
@@ -525,13 +520,7 @@ impl LauncherUiState {
             jvm_args: self
                 .settings
                 .use_custom_jvm_parameters
-                .then(|| {
-                    self.settings
-                        .custom_jvm_parameters
-                        .split_whitespace()
-                        .map(ToOwned::to_owned)
-                        .collect()
-                })
+                .then(|| parse_arg_string(&self.settings.custom_jvm_parameters))
                 .unwrap_or_default(),
             game_args: Vec::new(),
         }

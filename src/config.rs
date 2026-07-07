@@ -45,7 +45,7 @@ impl LauncherConfig {
             java_path: Some(defaults.default_java_executable_path.clone()),
             selected_version: None,
             memory_mb: Some(defaults.default_ram_mb),
-            extra_jvm_args: split_args(Some(defaults.default_modern_jvm_arguments.clone())),
+            extra_jvm_args: parse_arg_string(&defaults.default_modern_jvm_arguments),
             extra_game_args: Vec::new(),
             download_missing_libraries: defaults.default_download_missing_libraries,
             redownload_all_files: false,
@@ -114,10 +114,10 @@ impl LauncherConfig {
             config.memory_mb = value.parse::<u32>().ok();
         }
         if let Some(value) = take_string(&mut values, &["CustomParams", "extra_jvm_args"]) {
-            config.extra_jvm_args = split_args(Some(value));
+            config.extra_jvm_args = parse_arg_string(&value);
         }
         if let Some(value) = take_string(&mut values, &["extra_game_args"]) {
-            config.extra_game_args = split_args(Some(value));
+            config.extra_game_args = parse_arg_string(&value);
         }
         config.download_missing_libraries = take_bool(
             &mut values,
@@ -167,6 +167,10 @@ impl LauncherConfig {
     }
 
     pub fn to_config_string(&self) -> String {
+        // Keep writing the legacy key/value format so existing installations migrate
+        // without a separate conversion step. If the config format changes long-term,
+        // prefer a structured representation for argument vectors while continuing to
+        // read these legacy string fields.
         let mut lines = vec!["# Vortex Minecraft Launcher configuration".to_owned()];
         push_optional(&mut lines, "Name", self.username.as_deref());
         if let Some(memory_mb) = self.memory_mb {
@@ -189,14 +193,14 @@ impl LauncherConfig {
             self.use_custom_jvm_parameters
         ));
         if !self.extra_jvm_args.is_empty() {
-            lines.push(format!("CustomParams={}", self.extra_jvm_args.join(" ")));
+            lines.push(format!("CustomParams={}", join_args(&self.extra_jvm_args)));
         }
         lines.push(format!("KeepLauncherOpen={}", self.keep_launcher_open));
         push_optional_path(&mut lines, "game_directory", self.game_directory.as_deref());
         if !self.extra_game_args.is_empty() {
             lines.push(format!(
                 "extra_game_args={}",
-                self.extra_game_args.join(" ")
+                join_args(&self.extra_game_args)
             ));
         }
         lines.push(String::new());
@@ -204,12 +208,74 @@ impl LauncherConfig {
     }
 }
 
-fn split_args(value: Option<String>) -> Vec<String> {
-    value
-        .unwrap_or_default()
-        .split_whitespace()
-        .map(ToOwned::to_owned)
-        .collect()
+pub fn parse_arg_string(value: &str) -> Vec<String> {
+    let mut args = Vec::new();
+    let mut current = String::new();
+    let mut chars = value.chars().peekable();
+    let mut quote: Option<char> = None;
+    let mut arg_started = false;
+
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\\' => {
+                arg_started = true;
+                match chars.peek().copied() {
+                    Some(next)
+                        if next == '\\' || next == '"' || next == '\'' || next.is_whitespace() =>
+                    {
+                        current.push(chars.next().expect("peeked character must exist"));
+                    }
+                    Some(_) | None => current.push(ch),
+                }
+            }
+            '\'' | '"' if quote == Some(ch) => {
+                arg_started = true;
+                quote = None;
+            }
+            '\'' | '"' if quote.is_none() => {
+                arg_started = true;
+                quote = Some(ch);
+            }
+            ch if ch.is_whitespace() && quote.is_none() => {
+                if arg_started {
+                    args.push(std::mem::take(&mut current));
+                    arg_started = false;
+                }
+            }
+            _ => {
+                arg_started = true;
+                current.push(ch);
+            }
+        }
+    }
+
+    if arg_started {
+        args.push(current);
+    }
+
+    args
+}
+
+pub fn join_args(args: &[String]) -> String {
+    args.iter()
+        .map(|arg| quote_arg(arg))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn quote_arg(value: &str) -> String {
+    if value.is_empty() {
+        return "\"\"".to_owned();
+    }
+
+    if value
+        .chars()
+        .all(|ch| !ch.is_whitespace() && ch != '"' && ch != '\\')
+    {
+        return value.to_owned();
+    }
+
+    format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
 }
 
 fn take_string(values: &mut BTreeMap<String, String>, keys: &[&str]) -> Option<String> {
@@ -238,5 +304,81 @@ fn push_optional(lines: &mut Vec<String>, key: &str, value: Option<&str>) {
 fn push_optional_path(lines: &mut Vec<String>, key: &str, value: Option<&Path>) {
     if let Some(value) = value.and_then(Path::to_str) {
         lines.push(format!("{key}={value}"));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_arg_string_keeps_quoted_paths_and_properties_with_spaces() {
+        let args = parse_arg_string(
+            r#"-Djava.library.path="/home/me/Minecraft Libraries" -Dlauncher.name="Vortex Launcher" "#,
+        );
+
+        assert_eq!(
+            args,
+            vec![
+                "-Djava.library.path=/home/me/Minecraft Libraries".to_owned(),
+                "-Dlauncher.name=Vortex Launcher".to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_arg_string_preserves_escaped_quotes_inside_arguments() {
+        let args = parse_arg_string(r#"-Dtitle=\"Vortex Launcher\" "quoted value""#);
+
+        assert_eq!(
+            args,
+            vec![
+                "-Dtitle=\"Vortex Launcher\"".to_owned(),
+                "quoted value".to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn join_args_round_trips_custom_jvm_args_without_changing_meaning() {
+        let args = vec![
+            "-XX:+UnlockExperimentalVMOptions".to_owned(),
+            r#"-Djava.library.path=C:\Program Files\Minecraft Libraries"#.to_owned(),
+            r#"-Dlauncher.title=Vortex "Rust" Launcher"#.to_owned(),
+            "".to_owned(),
+        ];
+
+        assert_eq!(parse_arg_string(&join_args(&args)), args);
+    }
+
+    #[test]
+    fn legacy_config_migrates_space_containing_arguments_safely() {
+        let config = LauncherConfig::from_str(
+            r#"CustomParams=-Dpath="/opt/Minecraft Libraries" -Dname="Vortex Launcher"
+extra_game_args=--quickPlayPath "/home/me/New World"
+"#,
+        )
+        .expect("legacy config should parse");
+
+        assert_eq!(
+            config.extra_jvm_args,
+            vec![
+                "-Dpath=/opt/Minecraft Libraries".to_owned(),
+                "-Dname=Vortex Launcher".to_owned(),
+            ]
+        );
+        assert_eq!(
+            config.extra_game_args,
+            vec![
+                "--quickPlayPath".to_owned(),
+                "/home/me/New World".to_owned(),
+            ]
+        );
+        assert_eq!(
+            LauncherConfig::from_str(&config.to_config_string())
+                .expect("saved config should parse")
+                .extra_jvm_args,
+            config.extra_jvm_args
+        );
     }
 }
