@@ -1,0 +1,9 @@
+[package]
+name = "vortex-rust-launcher"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-only"
+description = "Rust scaffold for the Vortex Minecraft Launcher"
+repository = "https://github.com/Kron4ek/minecraft-vortex-launcher"
+
+[dependencies]
