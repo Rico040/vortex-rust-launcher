@@ -54,10 +54,28 @@ Build from the repository root:
 cargo build
 ```
 
-Run the launcher overview from the repository root:
+Open the interactive GUI from the repository root:
 
 ```sh
 cargo run
+```
+
+The GUI uses `egui`/`eframe` native windows. It provides editable launcher state, Play, Downloader, Settings, Save, and Download controls backed by the same config, launch, and download modules as the CLI.
+
+### GUI smoke checks
+
+Manual smoke check on supported desktop platforms (Windows, Linux, and macOS):
+
+```sh
+cargo run
+```
+
+Verify that the main launcher window opens, the Downloader and Settings buttons open child windows, Save and apply writes `vortex_launcher.conf`, Download starts the download command for the selected version, and Play attempts to validate Java and launch the configured Minecraft profile.
+
+Automated non-window checks:
+
+```sh
+cargo test
 ```
 
 ### Command interface
