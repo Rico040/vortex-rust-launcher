@@ -13,14 +13,11 @@ mod ui;
 
 fn main() {
     let runtime = platform::RuntimeEnvironment::detect();
-    let mut config = config::LauncherConfig::load_default().unwrap_or_default();
-
-    if config.java_path.is_none() {
-        config.java_path = runtime.find_java();
-    }
+    let config = config::LauncherConfig::load_default().unwrap_or_default();
 
     let profile = minecraft::LaunchProfile::from_config(&config);
     let download_plan = download::DownloadPlan::for_profile(&profile);
 
-    ui::LauncherUi::new(runtime, config, profile, download_plan).run();
+    let mut ui = ui::LauncherUi::new(runtime, config, profile, download_plan);
+    ui.run();
 }
