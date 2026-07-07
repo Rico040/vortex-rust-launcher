@@ -21,6 +21,7 @@ pub struct LauncherUi {
     layout: UiLayout,
     state: LauncherUiState,
     config: LauncherConfig,
+    persisted_config: LauncherConfig,
     config_path: PathBuf,
     download_plan: DownloadPlan,
 }
@@ -30,6 +31,7 @@ pub struct LauncherUiState {
     pub main: MainWindowState,
     pub downloader: DownloaderWindowState,
     pub settings: SettingsWindowState,
+    pub settings_dirty: bool,
     pub status_message: String,
 }
 
@@ -78,6 +80,7 @@ impl LauncherUi {
             runtime,
             layout,
             state,
+            persisted_config: config.clone(),
             config,
             config_path: PathBuf::from(DEFAULT_CONFIG_FILE),
             download_plan,
@@ -104,43 +107,89 @@ impl LauncherUi {
 
     pub fn save_config(&mut self) -> std::io::Result<()> {
         self.apply_state_to_config();
-        self.config.save(&self.config_path)
+        self.config.save(&self.config_path)?;
+        self.mark_persisted();
+        Ok(())
     }
     pub fn save_config_to(&mut self, path: impl AsRef<Path>) -> std::io::Result<()> {
         self.apply_state_to_config();
-        self.config.save(path)
+        self.config.save(path)?;
+        self.mark_persisted();
+        Ok(())
+    }
+
+    fn save_config_if_main_fields_changed(&mut self) -> std::io::Result<()> {
+        if self.main_fields_changed() {
+            self.save_config()?;
+        }
+        Ok(())
+    }
+
+    fn save_config_if_main_fields_changed_to(
+        &mut self,
+        path: impl AsRef<Path>,
+    ) -> std::io::Result<bool> {
+        if self.main_fields_changed() {
+            self.save_config_to(path)?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    fn mark_persisted(&mut self) {
+        self.persisted_config = self.config.clone();
+        self.state.settings_dirty = false;
+    }
+
+    fn projected_config(&self) -> LauncherConfig {
+        let mut config = self.config.clone();
+        Self::apply_state_to(&self.state, &mut config);
+        config
+    }
+
+    fn main_fields_changed(&self) -> bool {
+        let projected = self.projected_config();
+        projected.username != self.persisted_config.username
+            || projected.selected_version != self.persisted_config.selected_version
+            || projected.memory_mb != self.persisted_config.memory_mb
     }
 
     fn apply_state_to_config(&mut self) {
-        self.config.username = non_empty(self.state.main.player_name.replace(' ', ""));
-        self.config.selected_version = non_empty(self.state.main.selected_version.replace(' ', ""));
-        self.config.memory_mb = self.state.main.ram_mb.parse::<u32>().ok();
-        self.config.download_missing_libraries = self.state.settings.download_missing_libraries;
-        self.config.async_download = self.state.settings.async_download;
-        self.config.download_threads = self
-            .state
+        Self::apply_state_to(&self.state, &mut self.config);
+    }
+
+    fn apply_state_to(state: &LauncherUiState, config: &mut LauncherConfig) {
+        config.username = non_empty(state.main.player_name.replace(' ', ""));
+        config.selected_version = non_empty(state.main.selected_version.replace(' ', ""));
+        config.memory_mb = state.main.ram_mb.parse::<u32>().ok();
+        config.download_missing_libraries = state.settings.download_missing_libraries;
+        config.async_download = state.settings.async_download;
+        config.download_threads = state
             .settings
             .download_threads
             .parse()
-            .unwrap_or(self.config.download_threads);
-        self.config.use_custom_java = self.state.settings.use_custom_java;
-        self.config.java_path =
-            non_empty(self.state.settings.custom_java_path.clone()).map(PathBuf::from);
-        self.config.use_custom_jvm_parameters = self.state.settings.use_custom_jvm_parameters;
-        self.config.extra_jvm_args = self
-            .state
+            .unwrap_or(config.download_threads);
+        config.use_custom_java = state.settings.use_custom_java;
+        config.java_path = non_empty(state.settings.custom_java_path.clone()).map(PathBuf::from);
+        config.use_custom_jvm_parameters = state.settings.use_custom_jvm_parameters;
+        config.extra_jvm_args = state
             .settings
             .custom_jvm_parameters
             .split_whitespace()
             .map(ToOwned::to_owned)
             .collect();
-        self.config.save_launch_string = self.state.settings.save_launch_string;
-        self.config.keep_launcher_open = self.state.settings.keep_launcher_open;
-        self.config.show_all_versions = self.state.downloader.show_all_versions;
-        self.config.redownload_all_files = self.state.downloader.redownload_all_files;
+        config.save_launch_string = state.settings.save_launch_string;
+        config.keep_launcher_open = state.settings.keep_launcher_open;
+        config.show_all_versions = state.downloader.show_all_versions;
+        config.redownload_all_files = state.downloader.redownload_all_files;
     }
 
     fn handle_play(&mut self) -> bool {
+        if let Err(error) = self.save_config_if_main_fields_changed() {
+            self.state.status_message = format!("Could not save launch settings: {error}");
+            return false;
+        }
         self.apply_state_to_config();
         let profile = LaunchProfile::from_config(&self.config);
         match profile
@@ -172,10 +221,6 @@ impl LauncherUi {
     fn handle_download(&mut self) {
         self.state.main.selected_version = self.state.downloader.selected_version.clone();
         self.apply_state_to_config();
-        if let Err(error) = self.save_config() {
-            self.state.status_message = format!("Could not save download settings: {error}");
-            return;
-        }
 
         match std::env::current_exe().and_then(|exe| {
             std::process::Command::new(exe)
@@ -321,46 +366,67 @@ impl eframe::App for LauncherApp {
                 self.ui.layout.settings_window.1 as f32,
             ])
             .show(ctx, |ui| {
-                ui.checkbox(
-                    &mut self.ui.state.settings.async_download,
-                    "Fast multithreaded downloading",
-                );
+                let mut changed = ui
+                    .checkbox(
+                        &mut self.ui.state.settings.async_download,
+                        "Fast multithreaded downloading",
+                    )
+                    .changed();
                 ui.add_enabled_ui(self.ui.state.settings.async_download, |ui| {
                     ui.horizontal(|ui| {
                         ui.label("Download threads:");
-                        ui.text_edit_singleline(&mut self.ui.state.settings.download_threads);
+                        changed |= ui
+                            .text_edit_singleline(&mut self.ui.state.settings.download_threads)
+                            .changed();
                     });
                 });
-                ui.checkbox(
-                    &mut self.ui.state.settings.download_missing_libraries,
-                    "Download missing libraries on game start",
-                );
-                ui.checkbox(
-                    &mut self.ui.state.settings.save_launch_string,
-                    "Save the launch string to a file",
-                );
-                ui.checkbox(
-                    &mut self.ui.state.settings.use_custom_java,
-                    "Use custom Java",
-                );
+                changed |= ui
+                    .checkbox(
+                        &mut self.ui.state.settings.download_missing_libraries,
+                        "Download missing libraries on game start",
+                    )
+                    .changed();
+                changed |= ui
+                    .checkbox(
+                        &mut self.ui.state.settings.save_launch_string,
+                        "Save the launch string to a file",
+                    )
+                    .changed();
+                changed |= ui
+                    .checkbox(
+                        &mut self.ui.state.settings.use_custom_java,
+                        "Use custom Java",
+                    )
+                    .changed();
                 ui.add_enabled_ui(self.ui.state.settings.use_custom_java, |ui| {
                     ui.horizontal(|ui| {
                         ui.label("Path to Java binary:");
-                        ui.text_edit_singleline(&mut self.ui.state.settings.custom_java_path);
+                        changed |= ui
+                            .text_edit_singleline(&mut self.ui.state.settings.custom_java_path)
+                            .changed();
                     });
                 });
-                ui.checkbox(
-                    &mut self.ui.state.settings.use_custom_jvm_parameters,
-                    "Use custom launch parameters",
-                );
+                changed |= ui
+                    .checkbox(
+                        &mut self.ui.state.settings.use_custom_jvm_parameters,
+                        "Use custom launch parameters",
+                    )
+                    .changed();
                 ui.add_enabled_ui(self.ui.state.settings.use_custom_jvm_parameters, |ui| {
                     ui.label("Launch parameters:");
-                    ui.text_edit_multiline(&mut self.ui.state.settings.custom_jvm_parameters);
+                    changed |= ui
+                        .text_edit_multiline(&mut self.ui.state.settings.custom_jvm_parameters)
+                        .changed();
                 });
-                ui.checkbox(
-                    &mut self.ui.state.settings.keep_launcher_open,
-                    "Keep the launcher open",
-                );
+                changed |= ui
+                    .checkbox(
+                        &mut self.ui.state.settings.keep_launcher_open,
+                        "Keep the launcher open",
+                    )
+                    .changed();
+                if changed {
+                    self.ui.state.settings_dirty = true;
+                }
                 if ui.button("Save and apply").clicked() {
                     self.ui.handle_save();
                 }
@@ -439,6 +505,7 @@ impl LauncherUiState {
                 save_launch_string: config.save_launch_string,
                 keep_launcher_open: config.keep_launcher_open,
             },
+            settings_dirty: false,
             status_message: "Ready".to_owned(),
         }
     }
@@ -517,6 +584,17 @@ mod tests {
         ))
     }
 
+    fn ui_for_config(config: LauncherConfig, game_directory: PathBuf) -> LauncherUi {
+        let mut profile = LaunchProfile::from_config(&config);
+        profile.game_directory = game_directory;
+        LauncherUi::new(
+            RuntimeEnvironment::detect(),
+            config,
+            profile,
+            DownloadPlan::default(),
+        )
+    }
+
     #[test]
     fn scans_only_version_directories_with_matching_json() {
         let root = temp_game_dir();
@@ -572,6 +650,71 @@ mod tests {
             .versions_error
             .unwrap()
             .contains("Open Downloader"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn unchanged_main_fields_do_not_write_config() {
+        let root = temp_game_dir();
+        fs::create_dir_all(root.join("versions/1.20.4")).unwrap();
+        fs::write(root.join("versions/1.20.4/1.20.4.json"), "{}").unwrap();
+        let config_path = root.join("vortex_launcher.conf");
+        fs::write(&config_path, "original config").unwrap();
+
+        let mut config = LauncherConfig::default();
+        config.username = Some("Player".to_owned());
+        config.selected_version = Some("1.20.4".to_owned());
+        config.memory_mb = Some(2048);
+        let mut ui = ui_for_config(config, root.clone());
+
+        assert!(!ui
+            .save_config_if_main_fields_changed_to(&config_path)
+            .unwrap());
+        assert_eq!(fs::read_to_string(&config_path).unwrap(), "original config");
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn changed_main_fields_write_config_on_launch_save_path() {
+        let root = temp_game_dir();
+        fs::create_dir_all(root.join("versions/1.20.4")).unwrap();
+        fs::write(root.join("versions/1.20.4/1.20.4.json"), "{}").unwrap();
+        let config_path = root.join("vortex_launcher.conf");
+        fs::write(&config_path, "original config").unwrap();
+
+        let mut config = LauncherConfig::default();
+        config.username = Some("Player".to_owned());
+        config.selected_version = Some("1.20.4".to_owned());
+        config.memory_mb = Some(2048);
+        let mut ui = ui_for_config(config, root.clone());
+        ui.state.main.player_name = "Edited Player".to_owned();
+
+        assert!(ui
+            .save_config_if_main_fields_changed_to(&config_path)
+            .unwrap());
+        let saved = fs::read_to_string(&config_path).unwrap();
+        assert!(saved.contains("Name=EditedPlayer"));
+        assert!(!ui.state.settings_dirty);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn save_apply_clears_settings_dirty() {
+        let root = temp_game_dir();
+        let config_path = root.join("vortex_launcher.conf");
+        fs::create_dir_all(&root).unwrap();
+        let mut ui = ui_for_config(LauncherConfig::default(), root.clone());
+        ui.state.settings_dirty = true;
+        ui.state.settings.keep_launcher_open = true;
+
+        ui.save_config_to(&config_path).unwrap();
+
+        assert!(!ui.state.settings_dirty);
+        assert!(fs::read_to_string(&config_path)
+            .unwrap()
+            .contains("KeepLauncherOpen=true"));
         fs::remove_dir_all(root).unwrap();
     }
 }
