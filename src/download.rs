@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
+use std::time::{Duration, SystemTime};
 
 use crate::minecraft::{DownloadInfo, LaunchProfile, LibraryJson, Rule, RuleAction};
 use serde::Deserialize;
@@ -160,9 +161,80 @@ impl DownloadPlan {
     }
 
     pub fn from_config(profile: &LaunchProfile, options: DownloadOptions) -> Self {
-        let mut plan = Self::for_profile(profile);
-        plan.max_parallel_downloads = options.max_parallel_downloads.max(1);
+        let game_dir = &profile.game_directory;
+        let mut plan = Self {
+            tasks: Vec::new(),
+            max_parallel_downloads: options.max_parallel_downloads.max(1),
+        };
+        let manifest_path = game_dir.join("version_manifest_v2.json");
+        plan.push_if_needed(
+            DownloadJob::new(
+                DownloadKind::VersionManifest,
+                VERSION_MANIFEST_URL,
+                manifest_path.clone(),
+                "version manifest",
+            ),
+            options.mode,
+            true,
+        );
+
+        let Ok(manifest_text) = fs::read_to_string(&manifest_path) else {
+            return plan;
+        };
+        let Ok(manifest) = parse_versions_manifest(&manifest_text, options.include_snapshots)
+        else {
+            return plan;
+        };
+        let version = resolve_selected_version(&manifest, &profile.version_id);
+        let Some(version_job) = version_json_job(&manifest, game_dir, &version) else {
+            return plan;
+        };
+        plan.push_if_needed(version_job, options.mode, false);
+
+        let Ok(version_json) =
+            crate::minecraft::MinecraftVersionJson::load_resolved(game_dir, &version)
+        else {
+            return plan;
+        };
+        if let Some(job) = client_jar_job(&version_json, game_dir) {
+            plan.push_if_needed(job, options.mode, false);
+        }
+        for lib in parse_libraries(&version_json, game_dir) {
+            if let Some(job) = lib.artifact {
+                plan.push_if_needed(job, options.mode, false);
+            }
+            if let Some(job) = lib.native {
+                plan.push_if_needed(job, options.mode, false);
+            }
+        }
+        if let Some(job) = asset_index_job(&version_json, game_dir) {
+            let index_path = job.destination.clone();
+            plan.push_if_needed(job, options.mode, false);
+            if let Ok(index_json) = fs::read_to_string(index_path) {
+                if let Ok(assets) = assets_to_resources(&index_json, game_dir) {
+                    for asset in assets {
+                        plan.push_if_needed(asset.download, options.mode, false);
+                    }
+                }
+            }
+        }
+        if let Some(job) = logging_config_job(&version_json, game_dir) {
+            plan.push_if_needed(job, options.mode, false);
+        }
         plan
+    }
+
+    fn push_if_needed(&mut self, job: DownloadJob, mode: DownloadMode, stale_manifest: bool) {
+        let should_download = if mode == DownloadMode::AllFiles {
+            true
+        } else if stale_manifest {
+            file_is_missing_or_older_than(&job.destination, Duration::from_secs(60 * 60 * 24))
+        } else {
+            !existing_file_is_valid(&job)
+        };
+        if should_download {
+            self.tasks.push(job);
+        }
     }
 
     pub fn is_empty(&self) -> bool {
@@ -224,13 +296,54 @@ pub fn client_jar_job(
     version: &crate::minecraft::MinecraftVersionJson,
     game_dir: &Path,
 ) -> Option<DownloadJob> {
-    let id = version.id.as_deref()?;
+    let id = version.jar.as_deref().or(version.id.as_deref())?;
     let client = version.downloads.as_ref()?.client.as_ref()?;
     download_info_job(
         DownloadKind::ClientJar,
         client,
         game_dir.join("versions").join(id).join(format!("{id}.jar")),
         format!("client jar {id}"),
+    )
+}
+
+pub fn asset_index_job(
+    version: &crate::minecraft::MinecraftVersionJson,
+    game_dir: &Path,
+) -> Option<DownloadJob> {
+    let index = version.asset_index.as_ref()?;
+    let id = index.id.as_deref().or(version.assets.as_deref())?;
+    let url = index.url.as_ref()?;
+    Some(
+        DownloadJob::new(
+            DownloadKind::AssetIndex,
+            url,
+            game_dir
+                .join("assets")
+                .join("indexes")
+                .join(format!("{id}.json")),
+            format!("asset index {id}"),
+        )
+        .with_integrity(index.sha1.clone(), index.size),
+    )
+}
+
+pub fn logging_config_job(
+    version: &crate::minecraft::MinecraftVersionJson,
+    game_dir: &Path,
+) -> Option<DownloadJob> {
+    let file = version.logging.as_ref()?.client.as_ref()?.file.as_ref()?;
+    let url = file.url.as_ref()?;
+    Some(
+        DownloadJob::new(
+            DownloadKind::LogConfig,
+            url,
+            game_dir
+                .join("assets")
+                .join("log_configs")
+                .join(url.rsplit('/').next().unwrap_or("client-logging.xml")),
+            "client logging config",
+        )
+        .with_integrity(file.sha1.clone(), file.size),
     )
 }
 
@@ -639,6 +752,44 @@ fn ensure_slash(value: &str) -> String {
         format!("{value}/")
     }
 }
+fn existing_file_is_valid(job: &DownloadJob) -> bool {
+    let Ok(bytes) = fs::read(&job.destination) else {
+        return false;
+    };
+    if let Some(expected_size) = job.expected_size {
+        if bytes.len() as u64 != expected_size {
+            return false;
+        }
+    }
+    if let Some(expected_sha1) = &job.expected_sha1 {
+        if !expected_sha1.eq_ignore_ascii_case(&sha1_hex(&bytes)) {
+            return false;
+        }
+    }
+    true
+}
+
+fn file_is_missing_or_older_than(path: &Path, max_age: Duration) -> bool {
+    let Ok(modified) = path.metadata().and_then(|m| m.modified()) else {
+        return true;
+    };
+    SystemTime::now()
+        .duration_since(modified)
+        .map(|age| age > max_age)
+        .unwrap_or(false)
+}
+
+fn resolve_selected_version(manifest: &[ManifestVersion], selected: &str) -> String {
+    if selected == "latest" {
+        manifest
+            .first()
+            .map(|v| v.id.clone())
+            .unwrap_or_else(|| selected.to_owned())
+    } else {
+        selected.to_owned()
+    }
+}
+
 fn invalid_data(error: serde_json::Error) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, error)
 }
@@ -688,6 +839,77 @@ mod tests {
             PathBuf::from(".minecraft/resources/icons/icon_16x16.png")
         );
         assert_eq!(resource.download.expected_size, Some(12));
+    }
+
+    #[test]
+    fn plan_from_config_expands_local_metadata_and_skips_valid_missing_mode() {
+        let root = std::env::temp_dir().join(format!(
+            "vortex-plan-test-{}",
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(root.join("versions/1.0")).unwrap();
+        fs::create_dir_all(root.join("assets/indexes")).unwrap();
+        fs::write(
+            root.join("version_manifest_v2.json"),
+            r#"{"versions":[{"id":"1.0","type":"release","url":"https://example/1.0.json"}]}"#,
+        )
+        .unwrap();
+        let native_classifier = minecraft_native_classifier();
+        fs::write(
+            root.join("versions/1.0/1.0.json"),
+            format!(
+                r#"{{
+                "id":"1.0",
+                "downloads":{{"client":{{"url":"https://example/client.jar","sha1":"a9993e364706816aba3e25717850c26c9cd0d89d","size":3}}}},
+                "libraries":[{{"name":"org.example:lib:1.0","downloads":{{"artifact":{{"path":"org/example/lib/1.0/lib-1.0.jar","url":"https://example/lib.jar","sha1":"a9993e364706816aba3e25717850c26c9cd0d89d","size":3}},"classifiers":{{"{native_classifier}":{{"path":"org/example/lib/1.0/lib-1.0-{native_classifier}.jar","url":"https://example/native.jar"}}}}}}}}}],
+                "assetIndex":{{"id":"1","url":"https://example/assets.json"}},
+                "logging":{{"client":{{"file":{{"url":"https://example/log.xml"}}}}}}
+            }}"#
+            ),
+        )
+        .unwrap();
+        fs::write(
+            root.join("assets/indexes/1.json"),
+            r#"{"objects":{"icons/icon.png":{"hash":"abcdef0123456789abcdef0123456789abcdef01","size":12}}}"#,
+        )
+        .unwrap();
+        fs::create_dir_all(root.join("libraries/org/example/lib/1.0")).unwrap();
+        fs::write(
+            root.join("libraries/org/example/lib/1.0/lib-1.0.jar"),
+            b"abc",
+        )
+        .unwrap();
+
+        let profile = LaunchProfile {
+            username: "Player".to_owned(),
+            version_id: "1.0".to_owned(),
+            game_directory: root.clone(),
+            java_path: None,
+            memory_mb: 2048,
+            jvm_args: Vec::new(),
+            game_args: Vec::new(),
+        };
+        let options = DownloadOptions {
+            mode: DownloadMode::MissingLibraries,
+            include_snapshots: false,
+            max_parallel_downloads: 2,
+            async_download: false,
+        };
+        let plan = DownloadPlan::from_config(&profile, options);
+        let kinds = plan.tasks.iter().map(|job| &job.kind).collect::<Vec<_>>();
+
+        assert_eq!(plan.max_parallel_downloads, 2);
+        assert!(!kinds.contains(&&DownloadKind::Library));
+        assert!(kinds.contains(&&DownloadKind::ClientJar));
+        assert!(kinds.contains(&&DownloadKind::NativeLibrary));
+        assert!(kinds.contains(&&DownloadKind::AssetIndex));
+        assert!(kinds.contains(&&DownloadKind::Asset));
+        assert!(kinds.contains(&&DownloadKind::LogConfig));
+
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
