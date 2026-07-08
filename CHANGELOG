@@ -1,3 +1,16 @@
+Unreleased Rust rewrite
+	* Hardened Rust downloads against transient Windows/rustls TLS EOF failures by retrying retryable network, server, and integrity errors and cleaning failed temporary files.
+	* Downloader now runs inside the Rust GUI process and shows progress, files remaining, and failed-job details.
+	* Downloader now downloads full Minecraft client installs, including assets and logging configs, and deduplicates repeated destinations before parallel downloads.
+	* Fixed native-library extraction for deflated ZIP/JAR entries, including old LWJGL/OpenAL natives.
+	* Fixed classifier-only native libraries so nonexistent artifact URLs are not downloaded or added to the classpath.
+	* Downloaded versions now refresh into the main version selector after install.
+	* Downloader and Settings now open as separate native OS windows when supported by the egui backend.
+	* Removed the redundant manual version text box beside the main version selector.
+	* Footer now shows the author on the left and the version on the right.
+	* Rust launcher author string now displays "by ottie".
+	* Added automatic Java selection from Minecraft metadata and fallback version rules, with Windows Eclipse Adoptium discovery and custom Java override support.
+---------------------------------------------------------------------
 v1.1.20
 	* Fixed launching NeoForge and new Fabric versions
 	* Multithreaded downloading is enabled by default now

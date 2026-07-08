@@ -4,12 +4,13 @@
 
 use std::collections::BTreeMap;
 use std::fs;
-use std::io::{self, Read, Seek};
+use std::io;
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
 use crate::config::LauncherConfig;
+use crate::platform;
 
 const LAUNCHER_NAME: &str = "vortex-rust-launcher";
 const LAUNCHER_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -99,6 +100,7 @@ impl LaunchContext {
 #[serde(rename_all = "camelCase")]
 pub struct MinecraftVersionJson {
     pub id: Option<String>,
+    pub java_version: Option<JavaVersion>,
     pub main_class: Option<String>,
     pub assets: Option<String>,
     pub asset_index: Option<AssetIndex>,
@@ -110,6 +112,13 @@ pub struct MinecraftVersionJson {
     pub inherits_from: Option<String>,
     pub jar: Option<String>,
     pub logging: Option<LoggingJson>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct JavaVersion {
+    pub component: Option<String>,
+    pub major_version: Option<u32>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -255,6 +264,7 @@ impl MinecraftVersionJson {
             .or_else(|| self.jar.clone())
             .or_else(|| child.inherits_from.clone());
         self.id = child.id.or(self.id);
+        self.java_version = child.java_version.or(self.java_version);
         self.main_class = child.main_class.or(self.main_class);
         self.assets = child.assets.or(self.assets);
         self.asset_index = child.asset_index.or(self.asset_index);
@@ -294,24 +304,22 @@ impl MinecraftVersionJson {
         self.libraries
             .iter()
             .filter(|lib| rules_apply_with_context(&lib.rules, context))
-            .map(|lib| {
-                let path = lib
-                    .downloads
-                    .as_ref()
-                    .and_then(|d| d.artifact.as_ref())
+            .filter_map(|lib| {
+                let artifact = lib.downloads.as_ref().and_then(|d| d.artifact.as_ref());
+                let path = artifact
                     .and_then(|a| a.path.clone())
-                    .unwrap_or_else(|| maven_path(&lib.name));
+                    .or_else(|| lib.downloads.is_none().then(|| maven_path(&lib.name)))?;
                 let url = lib
                     .downloads
                     .as_ref()
                     .and_then(|d| d.artifact.as_ref())
                     .and_then(|a| a.url.clone())
                     .or_else(|| lib.url.clone());
-                Library {
+                Some(Library {
                     name: lib.name.clone(),
                     path: libraries_dir.join(path),
                     url,
-                }
+                })
             })
             .collect()
     }
@@ -337,6 +345,7 @@ impl MinecraftVersionJson {
         let java = profile
             .java_path
             .clone()
+            .or_else(|| platform::java_executable_for_major(self.required_java_major()))
             .unwrap_or_else(|| PathBuf::from("java"));
         let version_id = self.id.as_deref().unwrap_or(&profile.version_id);
         let jar_id = self.jar.as_deref().unwrap_or(version_id);
@@ -437,6 +446,18 @@ impl MinecraftVersionJson {
             launch_string,
         }
     }
+
+    pub fn required_java_major(&self) -> u32 {
+        self.java_version
+            .as_ref()
+            .and_then(|java| java.major_version)
+            .or_else(|| {
+                self.id
+                    .as_deref()
+                    .and_then(infer_java_major_from_minecraft_version)
+            })
+            .unwrap_or(8)
+    }
 }
 
 impl MinecraftVersionJson {
@@ -518,69 +539,30 @@ pub fn extract_native_archive(
     natives_dir: &Path,
     extract: Option<&ExtractRules>,
 ) -> io::Result<()> {
-    let mut file = fs::File::open(archive)?;
-    extract_stored_zip(&mut file, natives_dir, extract)
-}
+    let file = fs::File::open(archive)?;
+    let mut archive = zip::ZipArchive::new(file).map_err(zip_error)?;
 
-fn extract_stored_zip<R: Read + Seek>(
-    reader: &mut R,
-    natives_dir: &Path,
-    extract: Option<&ExtractRules>,
-) -> io::Result<()> {
-    loop {
-        let mut header = [0_u8; 30];
-        match reader.read_exact(&mut header) {
-            Ok(()) => {}
-            Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => return Ok(()),
-            Err(error) => return Err(error),
-        }
-        if u32::from_le_bytes(header[0..4].try_into().unwrap()) != 0x0403_4b50 {
-            return Ok(());
-        }
-        let method = u16::from_le_bytes(header[8..10].try_into().unwrap());
-        let compressed_size = u32::from_le_bytes(header[18..22].try_into().unwrap()) as u64;
-        let uncompressed_size = u32::from_le_bytes(header[22..26].try_into().unwrap()) as u64;
-        let name_len = u16::from_le_bytes(header[26..28].try_into().unwrap()) as usize;
-        let extra_len = u16::from_le_bytes(header[28..30].try_into().unwrap()) as u64;
-        let mut name = vec![0; name_len];
-        reader.read_exact(&mut name)?;
-        io::copy(&mut reader.by_ref().take(extra_len), &mut io::sink())?;
-        let name = String::from_utf8_lossy(&name).replace('\\', "/");
+    for index in 0..archive.len() {
+        let mut entry = archive.by_index(index).map_err(zip_error)?;
+        let name = entry.name().replace('\\', "/");
         let excluded = extract
             .map(|rules| rules.exclude.iter().any(|prefix| name.starts_with(prefix)))
             .unwrap_or(false);
         let safe_path = safe_zip_entry_path(&name);
-        if method != 0 {
-            io::copy(&mut reader.by_ref().take(compressed_size), &mut io::sink())?;
-            if !excluded && safe_path.is_some() {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("unsupported compression method {method} in {name}"),
-                ));
-            }
-            continue;
-        }
         let Some(relative) = safe_path else {
-            io::copy(&mut reader.by_ref().take(compressed_size), &mut io::sink())?;
             continue;
         };
-        if excluded || name.ends_with('/') {
-            io::copy(&mut reader.by_ref().take(compressed_size), &mut io::sink())?;
+        if excluded || entry.is_dir() {
             continue;
-        }
-        if compressed_size != uncompressed_size {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "stored zip size mismatch",
-            ));
         }
         let destination = natives_dir.join(relative);
         if let Some(parent) = destination.parent() {
             fs::create_dir_all(parent)?;
         }
         let mut output = fs::File::create(destination)?;
-        io::copy(&mut reader.by_ref().take(uncompressed_size), &mut output)?;
+        io::copy(&mut entry, &mut output)?;
     }
+    Ok(())
 }
 
 fn safe_zip_entry_path(name: &str) -> Option<PathBuf> {
@@ -598,6 +580,10 @@ fn safe_zip_entry_path(name: &str) -> Option<PathBuf> {
     (!clean.as_os_str().is_empty()).then_some(clean)
 }
 
+fn zip_error(error: zip::result::ZipError) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, error)
+}
+
 impl LaunchProfile {
     pub fn from_config(config: &LauncherConfig) -> Self {
         Self {
@@ -613,7 +599,10 @@ impl LaunchProfile {
                 .game_directory
                 .clone()
                 .unwrap_or_else(|| PathBuf::from(".minecraft")),
-            java_path: config.java_path.clone(),
+            java_path: config
+                .use_custom_java
+                .then(|| config.java_path.clone())
+                .flatten(),
             memory_mb: config.memory_mb.unwrap_or(2048),
             jvm_args: config.extra_jvm_args.clone(),
             game_args: config.extra_game_args.clone(),
@@ -642,6 +631,35 @@ impl LaunchProfile {
         let metadata = MinecraftVersionJson::load_resolved(&self.game_directory, &self.version_id)?;
         metadata.extract_native_libraries(self)?;
         Ok(metadata.build_launch_command(self, save_launch_string))
+    }
+}
+
+fn infer_java_major_from_minecraft_version(version: &str) -> Option<u32> {
+    let numeric = version.split(['-', '_']).next().unwrap_or(version);
+    let parts = numeric
+        .split('.')
+        .map(str::parse::<u32>)
+        .collect::<Result<Vec<_>, _>>()
+        .ok()?;
+    let [major, rest @ ..] = parts.as_slice() else {
+        return None;
+    };
+    if *major >= 26 {
+        return Some(25);
+    }
+    if *major != 1 {
+        return None;
+    }
+    let minor = *rest.first()?;
+    match minor {
+        0..=16 => Some(8),
+        17..=19 => Some(17),
+        20 => {
+            let patch = rest.get(1).copied().unwrap_or(0);
+            Some(if patch <= 4 { 17 } else { 21 })
+        }
+        21..=25 => Some(21),
+        _ => Some(25),
     }
 }
 
@@ -860,6 +878,37 @@ mod tests {
     }
 
     #[test]
+    fn java_requirement_uses_metadata_or_version_fallback() {
+        let modern: MinecraftVersionJson = serde_json::from_str(
+            r#"{"id":"1.20.6","javaVersion":{"component":"java-runtime-delta","majorVersion":21}}"#,
+        )
+        .unwrap();
+        assert_eq!(modern.required_java_major(), 21);
+
+        let legacy: MinecraftVersionJson = serde_json::from_str(r#"{"id":"1.12.2"}"#).unwrap();
+        assert_eq!(legacy.required_java_major(), 8);
+
+        assert_eq!(infer_java_major_from_minecraft_version("1.17.1"), Some(17));
+        assert_eq!(infer_java_major_from_minecraft_version("1.20.4"), Some(17));
+        assert_eq!(infer_java_major_from_minecraft_version("1.20.5"), Some(21));
+        assert_eq!(infer_java_major_from_minecraft_version("26.2"), Some(25));
+    }
+
+    #[test]
+    fn custom_java_is_only_used_when_enabled() {
+        let mut config = LauncherConfig::default();
+        config.java_path = Some(PathBuf::from("C:/Java/bin/javaw.exe"));
+        config.use_custom_java = false;
+        assert!(LaunchProfile::from_config(&config).java_path.is_none());
+
+        config.use_custom_java = true;
+        assert_eq!(
+            LaunchProfile::from_config(&config).java_path,
+            Some(PathBuf::from("C:/Java/bin/javaw.exe"))
+        );
+    }
+
+    #[test]
     fn rule_denial_overrides_previous_allow() {
         let rules: Vec<Rule> = serde_json::from_str(
             r#"[
@@ -897,6 +946,28 @@ mod tests {
     }
 
     #[test]
+    fn classifier_only_libraries_are_not_added_to_classpath() {
+        let version: MinecraftVersionJson = serde_json::from_str(
+            r#"{
+                "id":"1.0",
+                "libraries":[{
+                    "name":"net.java.jinput:jinput-platform:2.0.5",
+                    "natives":{"windows":"natives-windows","linux":"natives-linux","osx":"natives-osx"},
+                    "downloads":{"classifiers":{"natives-linux":{
+                        "path":"net/java/jinput/jinput-platform/2.0.5/jinput-platform-2.0.5-natives-linux.jar",
+                        "url":"https://example/native.jar"
+                    }}}
+                }]
+            }"#,
+        )
+        .unwrap();
+
+        assert!(version
+            .effective_libraries_with_context(".minecraft", &linux_context())
+            .is_empty());
+    }
+
+    #[test]
     fn extracts_native_zip_respecting_exclusions_and_safe_paths() {
         let root = std::env::temp_dir().join(format!(
             "vortex-native-test-{}",
@@ -910,12 +981,15 @@ mod tests {
         let archive = root.join("libraries/org/example/native/1.0/native-1.0-natives-linux.jar");
         fs::write(
             &archive,
-            stored_zip(&[
-                ("libnative.so", b"native" as &[u8]),
-                ("META-INF/MANIFEST.MF", b"manifest"),
-                ("nested/helper.so", b"helper"),
-                ("../escape.so", b"escape"),
-            ]),
+            test_zip(
+                &[
+                    ("libnative.so", b"native" as &[u8]),
+                    ("META-INF/MANIFEST.MF", b"manifest"),
+                    ("nested/helper.so", b"helper"),
+                    ("../escape.so", b"escape"),
+                ],
+                zip::CompressionMethod::Stored,
+            ),
         )
         .unwrap();
         let version: MinecraftVersionJson = serde_json::from_str(
@@ -954,23 +1028,41 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
-    fn stored_zip(entries: &[(&str, &[u8])]) -> Vec<u8> {
-        let mut zip = Vec::new();
+    #[test]
+    fn extracts_deflated_native_zip_entries() {
+        let root = std::env::temp_dir().join(format!(
+            "vortex-native-deflate-test-{}",
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let archive = root.join("native.jar");
+        fs::write(
+            &archive,
+            test_zip(
+                &[("OpenAL32.dll", b"openal" as &[u8])],
+                zip::CompressionMethod::Deflated,
+            ),
+        )
+        .unwrap();
+        let natives = root.join("natives");
+
+        extract_native_archive(&archive, &natives, None).unwrap();
+
+        assert_eq!(fs::read(natives.join("OpenAL32.dll")).unwrap(), b"openal");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    fn test_zip(entries: &[(&str, &[u8])], method: zip::CompressionMethod) -> Vec<u8> {
+        let cursor = std::io::Cursor::new(Vec::new());
+        let mut writer = zip::ZipWriter::new(cursor);
+        let options = zip::write::FileOptions::default().compression_method(method);
         for (name, contents) in entries {
-            zip.extend_from_slice(&0x0403_4b50_u32.to_le_bytes());
-            zip.extend_from_slice(&20_u16.to_le_bytes());
-            zip.extend_from_slice(&0_u16.to_le_bytes());
-            zip.extend_from_slice(&0_u16.to_le_bytes());
-            zip.extend_from_slice(&0_u16.to_le_bytes());
-            zip.extend_from_slice(&0_u16.to_le_bytes());
-            zip.extend_from_slice(&0_u32.to_le_bytes());
-            zip.extend_from_slice(&(contents.len() as u32).to_le_bytes());
-            zip.extend_from_slice(&(contents.len() as u32).to_le_bytes());
-            zip.extend_from_slice(&(name.len() as u16).to_le_bytes());
-            zip.extend_from_slice(&0_u16.to_le_bytes());
-            zip.extend_from_slice(name.as_bytes());
-            zip.extend_from_slice(contents);
+            writer.start_file(*name, options).unwrap();
+            std::io::Write::write_all(&mut writer, contents).unwrap();
         }
-        zip
+        writer.finish().unwrap().into_inner()
     }
 }

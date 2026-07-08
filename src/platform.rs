@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 use std::env;
+use std::fs;
 use std::path::{Path, PathBuf};
 
 const MODERN_JVM_ARGUMENTS: &str = "-Xss1M -XX:+UnlockExperimentalVMOptions -XX:+UseG1GC -XX:G1NewSizePercent=20 -XX:G1ReservePercent=20 -XX:MaxGCPauseMillis=50 -XX:G1HeapRegionSize=32M";
@@ -69,21 +70,22 @@ impl RuntimeEnvironment {
     }
 
     pub fn ui_layout(&self) -> UiLayout {
+        // Same sizes for all OSs for now.
         match self.os {
             OperatingSystem::Windows => UiLayout {
-                main_window: (350, 255),
-                downloader_window: (200, 120),
-                settings_window: (335, 255),
+                main_window: (240, 255),
+                downloader_window: (250, 160),
+                settings_window: (330, 300),
             },
             OperatingSystem::Linux | OperatingSystem::Other => UiLayout {
-                main_window: (350, 280),
-                downloader_window: (300, 160),
-                settings_window: (350, 315),
+                main_window: (240, 255),
+                downloader_window: (250, 160),
+                settings_window: (330, 300),
             },
             OperatingSystem::MacOs => UiLayout {
-                main_window: (350, 245),
-                downloader_window: (250, 140),
-                settings_window: (350, 315),
+                main_window: (240, 255),
+                downloader_window: (250, 160),
+                settings_window: (330, 300),
             },
         }
     }
@@ -109,6 +111,12 @@ impl RuntimeEnvironment {
             OperatingSystem::Linux | OperatingSystem::Other => find_on_path("java"),
         }
     }
+}
+
+pub fn java_executable_for_major(major: u32) -> Option<PathBuf> {
+    configured_java_path_for_major(major)
+        .or_else(|| java_home_for_major(major))
+        .or_else(|| discover_java_for_major(major))
 }
 
 impl OperatingSystem {
@@ -208,6 +216,128 @@ fn configured_java_path() -> Option<PathBuf> {
         .or_else(|| env::var_os("JAVA_PATH"))
         .filter(|path| !path.is_empty())
         .map(PathBuf::from)
+}
+
+fn configured_java_path_for_major(major: u32) -> Option<PathBuf> {
+    let key = format!("VORTEX_JAVA_{major}_PATH");
+    env::var_os(key)
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from)
+}
+
+fn java_home_for_major(major: u32) -> Option<PathBuf> {
+    let java_home = env::var_os("JAVA_HOME").map(PathBuf::from)?;
+    (java_major_from_install_dir(&java_home) == Some(major))
+        .then(|| java_executable_in(&java_home))
+        .flatten()
+}
+
+fn discover_java_for_major(major: u32) -> Option<PathBuf> {
+    if cfg!(target_os = "windows") {
+        discover_windows_java_for_major(major)
+    } else {
+        None
+    }
+}
+
+fn discover_windows_java_for_major(major: u32) -> Option<PathBuf> {
+    let program_files_dirs = [env::var_os("ProgramW6432"), env::var_os("PROGRAMFILES")];
+    let java_dirs = ["Eclipse Adoptium", "Java"];
+    for program_files_dir in program_files_dirs.into_iter().flatten() {
+        let program_files_dir = PathBuf::from(program_files_dir);
+        for java_dir in java_dirs {
+            let root = program_files_dir.join(java_dir);
+            let entries = match fs::read_dir(&root) {
+                Ok(entries) => entries,
+                Err(_) => continue,
+            };
+            let mut candidates = entries
+                .flatten()
+                .map(|entry| entry.path())
+                .filter(|path| java_major_from_install_dir(path) == Some(major))
+                .filter_map(|path| java_executable_in(&path))
+                .collect::<Vec<_>>();
+            candidates.sort();
+            if let Some(candidate) = candidates.pop() {
+                return Some(candidate);
+            }
+        }
+    }
+    None
+}
+
+fn java_executable_name() -> &'static str {
+    if cfg!(target_os = "windows") {
+        "javaw.exe"
+    } else {
+        "java"
+    }
+}
+
+fn java_executable_in(root: &Path) -> Option<PathBuf> {
+    if cfg!(target_os = "windows") {
+        ["javaw.exe", "java.exe"]
+            .into_iter()
+            .map(|name| root.join("bin").join(name))
+            .find(|path| path.is_file())
+    } else {
+        let executable = root.join("bin").join(java_executable_name());
+        executable.is_file().then_some(executable)
+    }
+}
+
+fn java_major_from_install_dir(path: &Path) -> Option<u32> {
+    java_major_from_release_file(&path.join("release"))
+        .or_else(|| java_major_from_name(path.file_name()?.to_string_lossy().as_ref()))
+}
+
+fn java_major_from_release_file(path: &Path) -> Option<u32> {
+    let release = fs::read_to_string(path).ok()?;
+    release
+        .lines()
+        .find_map(|line| line.strip_prefix("JAVA_VERSION=\""))
+        .and_then(|value| value.split('"').next())
+        .and_then(java_major_from_version_string)
+}
+
+fn java_major_from_name(name: &str) -> Option<u32> {
+    name.split(|ch: char| !ch.is_ascii_digit())
+        .filter(|part| !part.is_empty())
+        .find_map(|part| {
+            let value = part.parse::<u32>().ok()?;
+            (value == 8 || value >= 16).then_some(value)
+        })
+}
+
+fn java_major_from_version_string(version: &str) -> Option<u32> {
+    let mut parts = version.split('.');
+    let first = parts.next()?.parse::<u32>().ok()?;
+    if first == 1 {
+        parts.next()?.parse::<u32>().ok()
+    } else {
+        Some(first)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_java_major_from_release_versions() {
+        assert_eq!(java_major_from_version_string("1.8.0_402"), Some(8));
+        assert_eq!(java_major_from_version_string("17.0.11"), Some(17));
+        assert_eq!(java_major_from_version_string("21.0.5"), Some(21));
+        assert_eq!(java_major_from_version_string("25"), Some(25));
+    }
+
+    #[test]
+    fn parses_java_major_from_adoptium_folder_names() {
+        assert_eq!(java_major_from_name("jdk-8.0.402.6-hotspot"), Some(8));
+        assert_eq!(java_major_from_name("jdk-17.0.11.9-hotspot"), Some(17));
+        assert_eq!(java_major_from_name("jdk-21.0.5.11-hotspot"), Some(21));
+        assert_eq!(java_major_from_name("jdk-25.0.0.36-hotspot"), Some(25));
+    }
 }
 
 fn discover_windows_java() -> Option<PathBuf> {

@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 #![allow(dead_code)]
 
+use std::collections::HashSet;
 use std::collections::{BTreeMap, VecDeque};
 use std::fs;
 use std::io::{self, Read, Write};
@@ -10,6 +11,7 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, SystemTime};
 
+use crate::config::LauncherConfig;
 use crate::minecraft::{
     rules_apply_with_context, DownloadInfo, LaunchContext, LaunchProfile, LibraryJson,
 };
@@ -19,6 +21,7 @@ pub const VERSION_MANIFEST_URL: &str =
     "https://piston-meta.mojang.com/mc/game/version_manifest_v2.json";
 pub const LIBRARIES_BASE_URL: &str = "https://libraries.minecraft.net/";
 pub const ASSET_OBJECTS_BASE_URL: &str = "https://resources.download.minecraft.net/";
+const MAX_DOWNLOAD_ATTEMPTS: usize = 5;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DownloadKind {
@@ -162,6 +165,24 @@ impl std::error::Error for DownloadError {
     }
 }
 
+impl DownloadError {
+    fn is_retryable(&self) -> bool {
+        match self {
+            Self::Network { .. } => true,
+            Self::HttpStatus { status, .. } => matches!(*status, 429 | 500 | 502 | 503 | 504),
+            Self::Io(error) => matches!(
+                error.kind(),
+                io::ErrorKind::UnexpectedEof
+                    | io::ErrorKind::ConnectionReset
+                    | io::ErrorKind::ConnectionAborted
+                    | io::ErrorKind::TimedOut
+                    | io::ErrorKind::BrokenPipe
+            ),
+            Self::SizeMismatch { .. } | Self::Sha1Mismatch { .. } => true,
+        }
+    }
+}
+
 impl From<io::Error> for DownloadError {
     fn from(error: io::Error) -> Self {
         Self::Io(error)
@@ -287,6 +308,127 @@ impl DownloadPlan {
     }
 }
 
+pub fn download_selected_version(
+    config: &LauncherConfig,
+    sender: mpsc::Sender<DownloadEvent>,
+) -> io::Result<String> {
+    let profile = LaunchProfile::from_config(config);
+    let manifest = fetch_manifest(config.show_all_versions)?;
+    let version = resolve_selected_version(&manifest, &profile.version_id);
+    let game_dir = &profile.game_directory;
+    fs::create_dir_all(game_dir)?;
+
+    run_jobs(
+        vec![
+            DownloadJob::new(
+                DownloadKind::VersionManifest,
+                VERSION_MANIFEST_URL,
+                game_dir.join("version_manifest_v2.json"),
+                "version manifest",
+            ),
+            version_json_job(&manifest, game_dir, &version).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("version '{version}' not found"),
+                )
+            })?,
+        ],
+        config,
+        &sender,
+    )?;
+
+    let version_json = crate::minecraft::MinecraftVersionJson::load_resolved(game_dir, &version)?;
+    let mut jobs = Vec::new();
+    if let Some(job) = client_jar_job(&version_json, game_dir) {
+        jobs.push(job);
+    }
+    for lib in parse_libraries(&version_json, game_dir) {
+        if let Some(job) = lib.artifact {
+            jobs.push(job);
+        }
+        if let Some(job) = lib.native {
+            jobs.push(job);
+        }
+    }
+    if let Some(job) = asset_index_job(&version_json, game_dir) {
+        jobs.push(job);
+    }
+    if let Some(job) = logging_config_job(&version_json, game_dir) {
+        jobs.push(job);
+    }
+    run_jobs(jobs, config, &sender)?;
+
+    if let Some(index_id) = version_json
+        .asset_index
+        .as_ref()
+        .and_then(|i| i.id.as_ref())
+    {
+        let index_path = game_dir
+            .join("assets")
+            .join("indexes")
+            .join(format!("{index_id}.json"));
+        if index_path.exists() {
+            let assets = assets_to_resources(&fs::read_to_string(index_path)?, game_dir)?;
+            run_jobs(
+                assets.into_iter().map(|asset| asset.download).collect(),
+                config,
+                &sender,
+            )?;
+        }
+    }
+
+    Ok(version)
+}
+
+fn run_jobs(
+    jobs: Vec<DownloadJob>,
+    config: &LauncherConfig,
+    sender: &mpsc::Sender<DownloadEvent>,
+) -> io::Result<()> {
+    let jobs = dedupe_jobs_by_destination(jobs);
+    if jobs.is_empty() {
+        return Ok(());
+    }
+    let options = DownloadOptions {
+        mode: if config.redownload_all_files {
+            DownloadMode::AllFiles
+        } else {
+            DownloadMode::MissingLibraries
+        },
+        include_snapshots: config.show_all_versions,
+        max_parallel_downloads: config.download_threads,
+        async_download: false,
+    };
+    let summary = execute_downloads(jobs, options.max_parallel_downloads, sender.clone());
+    if summary.failed == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::other(format!(
+            "{} downloads failed",
+            summary.failed
+        )))
+    }
+}
+
+fn dedupe_jobs_by_destination(jobs: Vec<DownloadJob>) -> Vec<DownloadJob> {
+    let mut seen = HashSet::new();
+    jobs.into_iter()
+        .filter(|job| seen.insert(job.destination.clone()))
+        .collect()
+}
+
+fn fetch_manifest(include_snapshots: bool) -> io::Result<Vec<ManifestVersion>> {
+    let manifest = ureq::AgentBuilder::new()
+        .timeout(Duration::from_secs(30))
+        .build()
+        .get(VERSION_MANIFEST_URL)
+        .call()
+        .map_err(|error| io::Error::other(error.to_string()))?
+        .into_string()
+        .map_err(|error| io::Error::other(error.to_string()))?;
+    parse_versions_manifest(&manifest, include_snapshots)
+}
+
 #[derive(Debug, Deserialize)]
 struct VersionManifestJson {
     versions: Vec<VersionManifestEntry>,
@@ -406,36 +548,30 @@ pub fn parse_libraries(
 }
 
 fn resolve_library(lib: &LibraryJson, libraries_dir: &Path) -> ResolvedLibrary {
-    let artifact_path = lib
-        .downloads
-        .as_ref()
-        .and_then(|d| d.artifact.as_ref())
-        .and_then(|a| a.path.clone())
-        .unwrap_or_else(|| maven_path(&lib.name));
-    let artifact_url = lib
-        .downloads
-        .as_ref()
-        .and_then(|d| d.artifact.as_ref())
-        .and_then(|a| a.url.clone())
-        .or_else(|| {
-            lib.url
-                .as_ref()
-                .map(|base| format!("{}{}", ensure_slash(base), artifact_path))
-        })
-        .unwrap_or_else(|| format!("{LIBRARIES_BASE_URL}{artifact_path}"));
     let artifact_info = lib.downloads.as_ref().and_then(|d| d.artifact.as_ref());
-    let artifact = Some(
+    let artifact_path = artifact_info
+        .and_then(|a| a.path.clone())
+        .or_else(|| lib.downloads.is_none().then(|| maven_path(&lib.name)));
+    let artifact = artifact_path.as_ref().map(|artifact_path| {
+        let artifact_url = artifact_info
+            .and_then(|a| a.url.clone())
+            .or_else(|| {
+                lib.url
+                    .as_ref()
+                    .map(|base| format!("{}{}", ensure_slash(base), artifact_path))
+            })
+            .unwrap_or_else(|| format!("{LIBRARIES_BASE_URL}{artifact_path}"));
         DownloadJob::new(
             DownloadKind::Library,
             artifact_url,
-            libraries_dir.join(&artifact_path),
+            libraries_dir.join(artifact_path),
             lib.name.clone(),
         )
         .with_integrity(
             artifact_info.and_then(|a| a.sha1.clone()),
             artifact_info.and_then(|a| a.size),
-        ),
-    );
+        )
+    });
     let native_classifier = native_classifier_for_library(lib);
     let native = native_classifier.as_deref().and_then(|native_classifier| {
         lib.downloads
@@ -457,7 +593,7 @@ fn resolve_library(lib: &LibraryJson, libraries_dir: &Path) -> ResolvedLibrary {
     });
     ResolvedLibrary {
         name: lib.name.clone(),
-        classpath_path: Some(libraries_dir.join(artifact_path)),
+        classpath_path: artifact_path.map(|path| libraries_dir.join(path)),
         artifact,
         native,
     }
@@ -563,7 +699,7 @@ pub fn execute_downloads(
                 index,
                 label: job.label.clone(),
             });
-            match download_one(&job, index, &sender) {
+            match download_with_retries(&job, index, &sender) {
                 Ok(()) => {
                     let _ = sender.send(DownloadEvent::JobFinished {
                         index,
@@ -601,7 +737,33 @@ pub fn execute_downloads(
     summary
 }
 
-fn download_one(
+fn download_with_retries(
+    job: &DownloadJob,
+    index: usize,
+    sender: &mpsc::Sender<DownloadEvent>,
+) -> Result<(), DownloadError> {
+    let mut last_error = None;
+    for attempt in 1..=MAX_DOWNLOAD_ATTEMPTS {
+        match download_one_attempt(job, index, sender) {
+            Ok(()) => return Ok(()),
+            Err(error) if attempt < MAX_DOWNLOAD_ATTEMPTS && error.is_retryable() => {
+                let _ = fs::remove_file(job.destination.with_extension("download"));
+                last_error = Some(error);
+                let backoff_ms = 500 * attempt as u64;
+                thread::sleep(Duration::from_millis(backoff_ms));
+            }
+            Err(error) => {
+                let _ = fs::remove_file(job.destination.with_extension("download"));
+                return Err(error);
+            }
+        }
+    }
+
+    let _ = fs::remove_file(job.destination.with_extension("download"));
+    Err(last_error.expect("retry loop must store the last retryable error"))
+}
+
+fn download_one_attempt(
     job: &DownloadJob,
     index: usize,
     sender: &mpsc::Sender<DownloadEvent>,
@@ -611,6 +773,7 @@ fn download_one(
     }
 
     let tmp = job.destination.with_extension("download");
+    let _ = fs::remove_file(&tmp);
     let mut file = fs::File::create(&tmp)?;
     let mut downloaded = 0_u64;
     let total = job.expected_size;
@@ -984,6 +1147,57 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_download_destinations_are_scheduled_once() {
+        let destination = PathBuf::from(".minecraft/libraries/example.jar");
+        let jobs = vec![
+            DownloadJob::new(
+                DownloadKind::Library,
+                "https://example/first.jar",
+                destination.clone(),
+                "first",
+            ),
+            DownloadJob::new(
+                DownloadKind::Library,
+                "https://example/second.jar",
+                destination.clone(),
+                "second",
+            ),
+        ];
+
+        let deduped = dedupe_jobs_by_destination(jobs);
+
+        assert_eq!(deduped.len(), 1);
+        assert_eq!(deduped[0].url, "https://example/first.jar");
+        assert_eq!(deduped[0].destination, destination);
+    }
+
+    #[test]
+    fn classifier_only_library_does_not_invent_artifact_download() {
+        let native_classifier = minecraft_native_classifier();
+        let version: crate::minecraft::MinecraftVersionJson = serde_json::from_str(&format!(
+            r#"{{
+                "id":"1.0",
+                "libraries":[{{
+                    "name":"net.java.jinput:jinput-platform:2.0.5",
+                    "natives":{{"windows":"natives-windows","linux":"natives-linux","osx":"natives-osx"}},
+                    "downloads":{{"classifiers":{{"{native_classifier}":{{
+                        "path":"net/java/jinput/jinput-platform/2.0.5/jinput-platform-2.0.5-{native_classifier}.jar",
+                        "url":"https://example/native.jar"
+                    }}}}}}
+                }}]
+            }}"#
+        ))
+        .unwrap();
+
+        let libraries = parse_libraries(&version, Path::new(".minecraft"));
+
+        assert_eq!(libraries.len(), 1);
+        assert!(libraries[0].artifact.is_none());
+        assert!(libraries[0].classpath_path.is_none());
+        assert!(libraries[0].native.is_some());
+    }
+
+    #[test]
     fn plan_from_config_expands_local_metadata_and_skips_valid_missing_mode() {
         let root = std::env::temp_dir().join(format!(
             "vortex-plan-test-{}",
@@ -1006,8 +1220,14 @@ mod tests {
                 r#"{{
                 "id":"1.0",
                 "downloads":{{"client":{{"url":"https://example/client.jar","sha1":"a9993e364706816aba3e25717850c26c9cd0d89d","size":3}}}},
-                "libraries":[{{"name":"org.example:lib:1.0","downloads":{{"artifact":{{"path":"org/example/lib/1.0/lib-1.0.jar","url":"https://example/lib.jar","sha1":"a9993e364706816aba3e25717850c26c9cd0d89d","size":3}},"classifiers":{{"{native_classifier}":{{"path":"org/example/lib/1.0/lib-1.0-{native_classifier}.jar","url":"https://example/native.jar"}}}}}}}}}}],
-                "assetIndex":{{"id":"1","url":"https://example/assets.json"}},
+                "libraries":[{{
+                    "name":"org.example:lib:1.0",
+                    "downloads":{{
+                        "artifact":{{"path":"org/example/lib/1.0/lib-1.0.jar","url":"https://example/lib.jar","sha1":"a9993e364706816aba3e25717850c26c9cd0d89d","size":3}},
+                        "classifiers":{{"{native_classifier}":{{"path":"org/example/lib/1.0/lib-1.0-{native_classifier}.jar","url":"https://example/native.jar"}}}}
+                    }}
+                }}],
+                "assetIndex":{{"id":"1","url":"https://example/assets.json","size":999}},
                 "logging":{{"client":{{"file":{{"url":"https://example/log.xml"}}}}}}
             }}"#
             ),
@@ -1060,6 +1280,41 @@ mod tests {
     }
 
     #[test]
+    fn retry_policy_covers_transient_network_and_integrity_failures() {
+        assert!(DownloadError::Network {
+            url: "https://example/asset.ogg".to_owned(),
+            message: "peer closed connection without sending TLS close_notify".to_owned(),
+        }
+        .is_retryable());
+        assert!(DownloadError::Io(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "unexpected eof",
+        ))
+        .is_retryable());
+        assert!(DownloadError::HttpStatus {
+            url: "https://example/asset.ogg".to_owned(),
+            status: 503,
+        }
+        .is_retryable());
+        assert!(DownloadError::Sha1Mismatch {
+            expected: "expected".to_owned(),
+            actual: "actual".to_owned(),
+        }
+        .is_retryable());
+
+        assert!(!DownloadError::HttpStatus {
+            url: "https://example/missing.ogg".to_owned(),
+            status: 404,
+        }
+        .is_retryable());
+        assert!(!DownloadError::Io(io::Error::new(
+            io::ErrorKind::NotFound,
+            "missing local file",
+        ))
+        .is_retryable());
+    }
+
+    #[test]
     fn download_streams_file_url_with_progress_and_atomic_destination() {
         let root = std::env::temp_dir().join(format!(
             "vortex-download-test-{}",
@@ -1084,7 +1339,7 @@ mod tests {
             Some(3),
         );
 
-        download_one(&job, 7, &tx).unwrap();
+        download_with_retries(&job, 7, &tx).unwrap();
 
         assert_eq!(fs::read(&destination).unwrap(), b"abc");
         assert!(!destination.with_extension("download").exists());
@@ -1123,7 +1378,7 @@ mod tests {
         )
         .with_integrity(Some(sha1_hex(&bytes)), Some(bytes.len() as u64));
 
-        download_one(&job, 3, &tx).unwrap();
+        download_with_retries(&job, 3, &tx).unwrap();
 
         let progress = rx
             .try_iter()

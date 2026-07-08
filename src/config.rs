@@ -213,6 +213,7 @@ pub fn parse_arg_string(value: &str) -> Vec<String> {
     let mut current = String::new();
     let mut chars = value.chars().peekable();
     let mut quote: Option<char> = None;
+    let mut escaped_quote_delimiter = false;
     let mut arg_started = false;
 
     while let Some(ch) = chars.next() {
@@ -220,9 +221,18 @@ pub fn parse_arg_string(value: &str) -> Vec<String> {
             '\\' => {
                 arg_started = true;
                 match chars.peek().copied() {
-                    Some(next)
-                        if next == '\\' || next == '"' || next == '\'' || next.is_whitespace() =>
-                    {
+                    Some(next) if next == '"' || next == '\'' => {
+                        let argument_had_content = !current.is_empty();
+                        current.push(chars.next().expect("peeked character must exist"));
+                        if quote == Some(next) && escaped_quote_delimiter {
+                            quote = None;
+                            escaped_quote_delimiter = false;
+                        } else if quote.is_none() && argument_had_content {
+                            quote = Some(next);
+                            escaped_quote_delimiter = true;
+                        }
+                    }
+                    Some(next) if next == '\\' || next.is_whitespace() => {
                         current.push(chars.next().expect("peeked character must exist"));
                     }
                     Some(_) | None => current.push(ch),
@@ -231,10 +241,12 @@ pub fn parse_arg_string(value: &str) -> Vec<String> {
             '\'' | '"' if quote == Some(ch) => {
                 arg_started = true;
                 quote = None;
+                escaped_quote_delimiter = false;
             }
             '\'' | '"' if quote.is_none() => {
                 arg_started = true;
                 quote = Some(ch);
+                escaped_quote_delimiter = false;
             }
             ch if ch.is_whitespace() && quote.is_none() => {
                 if arg_started {

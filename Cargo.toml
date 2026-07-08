@@ -4,10 +4,11 @@ version = "0.1.0"
 edition = "2021"
 license = "GPL-3.0-only"
 description = "Rust implementation of the Vortex Minecraft Launcher"
-repository = "https://github.com/Kron4ek/minecraft-vortex-launcher"
+repository = "https://github.com/Rico040/vortex-rust-launcher"
 
 [dependencies]
 eframe = "0.28"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 ureq = "2"
+zip = { version = "0.6", default-features = false, features = ["deflate"] }

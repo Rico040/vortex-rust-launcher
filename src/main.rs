@@ -15,9 +15,6 @@ mod ui;
 use std::fs;
 use std::io;
 use std::process::Command;
-use std::sync::mpsc;
-
-use download::{DownloadJob, DownloadKind, DownloadMode, DownloadOptions};
 
 fn main() {
     if let Err(error) = run() {
@@ -78,126 +75,15 @@ fn list_versions(include_snapshots: bool) -> io::Result<()> {
 }
 
 fn download_selected_version(config: &config::LauncherConfig) -> io::Result<()> {
-    let profile = minecraft::LaunchProfile::from_config(config);
-    let version = resolve_latest_alias(&profile.version_id, config.show_all_versions)?;
-    let manifest = fetch_manifest(config.show_all_versions)?;
-    let game_dir = &profile.game_directory;
-    fs::create_dir_all(game_dir)?;
-
-    let mut jobs = Vec::new();
-    jobs.push(DownloadJob::new(
-        DownloadKind::VersionManifest,
-        download::VERSION_MANIFEST_URL,
-        game_dir.join("version_manifest_v2.json"),
-        "version manifest",
-    ));
-    jobs.push(
-        download::version_json_job(&manifest, game_dir, &version).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::NotFound,
-                format!("version '{version}' not found"),
-            )
-        })?,
-    );
-    run_jobs(jobs, config)?;
-
-    let version_json = minecraft::MinecraftVersionJson::load_resolved(game_dir, &version)?;
-    let mut jobs = Vec::new();
-    if let Some(job) = download::client_jar_job(&version_json, game_dir) {
-        jobs.push(job);
-    }
-    for lib in download::parse_libraries(&version_json, game_dir) {
-        if let Some(job) = lib.artifact {
-            jobs.push(job);
-        }
-        if let Some(job) = lib.native {
-            jobs.push(job);
-        }
-    }
-    if let Some(index) = version_json.asset_index.as_ref() {
-        if let (Some(id), Some(url)) = (&index.id, &index.url) {
-            jobs.push(
-                DownloadJob::new(
-                    DownloadKind::AssetIndex,
-                    url,
-                    game_dir
-                        .join("assets")
-                        .join("indexes")
-                        .join(format!("{id}.json")),
-                    format!("asset index {id}"),
-                )
-                .with_integrity(index.sha1.clone(), index.size),
-            );
-        }
-    }
-    if let Some(log) = version_json
-        .logging
-        .as_ref()
-        .and_then(|l| l.client.as_ref())
-        .and_then(|c| c.file.as_ref())
-    {
-        if let Some(url) = &log.url {
-            jobs.push(
-                DownloadJob::new(
-                    DownloadKind::LogConfig,
-                    url,
-                    game_dir
-                        .join("assets")
-                        .join("log_configs")
-                        .join(url.rsplit('/').next().unwrap_or("client-logging.xml")),
-                    "client logging config",
-                )
-                .with_integrity(log.sha1.clone(), log.size),
-            );
-        }
-    }
-    run_jobs(jobs, config)?;
-
-    if let Some(index_id) = version_json
-        .asset_index
-        .as_ref()
-        .and_then(|i| i.id.as_ref())
-    {
-        let index_path = game_dir
-            .join("assets")
-            .join("indexes")
-            .join(format!("{index_id}.json"));
-        if index_path.exists() {
-            let assets = download::assets_to_resources(&fs::read_to_string(index_path)?, game_dir)?;
-            run_jobs(assets.into_iter().map(|a| a.download).collect(), config)?;
-        }
-    }
-    println!("Downloaded Minecraft {version} into {}", game_dir.display());
-    Ok(())
-}
-
-fn run_jobs(jobs: Vec<DownloadJob>, config: &config::LauncherConfig) -> io::Result<()> {
-    if jobs.is_empty() {
-        return Ok(());
-    }
-    let (tx, rx) = mpsc::channel();
-    let options = DownloadOptions {
-        mode: if config.redownload_all_files {
-            DownloadMode::AllFiles
-        } else {
-            DownloadMode::MissingLibraries
-        },
-        include_snapshots: config.show_all_versions,
-        max_parallel_downloads: config.download_threads,
-        async_download: false,
-    };
-    let summary = download::execute_downloads(jobs, options.max_parallel_downloads, tx);
+    let (tx, rx) = std::sync::mpsc::channel();
+    let result = download::download_selected_version(config, tx);
     for event in rx.try_iter() {
         println!("{event:?}");
     }
-    if summary.failed == 0 {
-        Ok(())
-    } else {
-        Err(io::Error::other(format!(
-            "{} downloads failed",
-            summary.failed
-        )))
-    }
+    let version = result?;
+    let game_dir = minecraft::LaunchProfile::from_config(config).game_directory;
+    println!("Downloaded Minecraft {version} into {}", game_dir.display());
+    Ok(())
 }
 
 fn launch_selected_version(config: &config::LauncherConfig) -> io::Result<()> {
