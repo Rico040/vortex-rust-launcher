@@ -32,6 +32,8 @@ pub struct LauncherUi {
     download_plan: DownloadPlan,
     download_rx: Option<mpsc::Receiver<DownloadEvent>>,
     download_handle: Option<thread::JoinHandle<Result<String, String>>>,
+    game_rx: Option<mpsc::Receiver<Result<String, String>>>,
+    game_handle: Option<thread::JoinHandle<()>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -102,6 +104,8 @@ impl LauncherUi {
             download_plan,
             download_rx: None,
             download_handle: None,
+            game_rx: None,
+            game_handle: None,
         }
     }
 
@@ -198,13 +202,26 @@ impl LauncherUi {
         config.redownload_all_files = state.downloader.redownload_all_files;
     }
 
-    fn handle_play(&mut self) -> bool {
+    fn handle_play(&mut self, ctx: egui::Context) -> bool {
+        eprintln!("[launcher] GUI Play clicked");
+        if self.game_running() {
+            self.state.status_message = "Minecraft is already running".to_owned();
+            return false;
+        }
         if let Err(error) = self.save_config_if_main_fields_changed() {
+            eprintln!("[launcher] Could not save launch settings before play: {error}");
             self.state.status_message = format!("Could not save launch settings: {error}");
             return false;
         }
         self.apply_state_to_config();
         let profile = LaunchProfile::from_config(&self.config);
+        eprintln!(
+            "[launcher] GUI launch profile: version={}, player={}, game_dir={}, memory={}M",
+            profile.version_id,
+            profile.username,
+            profile.game_directory.display(),
+            profile.memory_mb
+        );
         match profile
             .launch_command(self.config.save_launch_string)
             .and_then(|command| {
@@ -218,21 +235,82 @@ impl LauncherUi {
                 if let Some(display) = outcome.display_command {
                     std::fs::write("launch_string.txt", display)?;
                 }
-                Ok((outcome.child.id(), outcome.should_close_launcher))
+                Ok(outcome.child)
             }) {
-            Ok((pid, should_close_launcher)) => {
-                self.state.status_message = format!("Launched Minecraft with pid {pid}");
-                should_close_launcher
+            Ok(mut child) => {
+                let pid = child.id();
+                eprintln!(
+                    "[launcher] GUI launch succeeded: pid={pid}; hiding launcher until Minecraft exits"
+                );
+                let (tx, rx) = mpsc::channel();
+                self.game_rx = Some(rx);
+                self.game_handle = Some(thread::spawn(move || {
+                    let result = child
+                        .wait()
+                        .map(|status| format!("Minecraft closed with status {status}"))
+                        .map_err(|error| format!("Could not wait for Minecraft: {error}"));
+                    let _ = tx.send(result);
+                    ctx.request_repaint();
+                }));
+                self.state.status_message = format!("Minecraft running with pid {pid}");
+                true
             }
             Err(error) => {
+                eprintln!("[launcher] GUI launch failed: {error}");
                 self.state.status_message = format!("Launch failed: {error}");
                 false
             }
         }
     }
 
+    fn game_running(&self) -> bool {
+        self.game_handle.is_some()
+    }
+
+    fn pump_game_events(&mut self) -> bool {
+        let Some(rx) = self.game_rx.take() else {
+            return false;
+        };
+
+        match rx.try_recv() {
+            Ok(Ok(message)) => {
+                eprintln!("[launcher] {message}");
+                self.state.status_message = message;
+                self.finish_game_monitor();
+                true
+            }
+            Ok(Err(error)) => {
+                eprintln!("[launcher] {error}");
+                self.state.status_message = error;
+                self.finish_game_monitor();
+                true
+            }
+            Err(mpsc::TryRecvError::Empty) => {
+                self.game_rx = Some(rx);
+                false
+            }
+            Err(mpsc::TryRecvError::Disconnected) => {
+                let message = "Minecraft process monitor stopped".to_owned();
+                eprintln!("[launcher] {message}");
+                self.state.status_message = message;
+                self.finish_game_monitor();
+                true
+            }
+        }
+    }
+
+    fn finish_game_monitor(&mut self) {
+        if let Some(handle) = self.game_handle.take() {
+            if handle.join().is_err() {
+                eprintln!("[launcher] Minecraft process monitor panicked");
+            }
+        }
+        self.game_rx = None;
+    }
+
     fn handle_download(&mut self) {
         if self.state.downloader.download_running {
+            eprintln!("[download] GUI download requested while another download is running");
             self.state.status_message = "Download already in progress".to_owned();
             return;
         }
@@ -240,6 +318,17 @@ impl LauncherUi {
         self.apply_state_to_config();
         let config = self.config.clone();
         let version = self.state.main.selected_version.clone();
+        eprintln!(
+            "[download] GUI download clicked: version={version}, game_dir={}, threads={}, redownload_all={}, snapshots={}",
+            config
+                .game_directory
+                .as_ref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| ".minecraft".to_owned()),
+            config.download_threads,
+            config.redownload_all_files,
+            config.show_all_versions
+        );
         let (tx, rx) = mpsc::channel();
         self.download_rx = Some(rx);
         self.download_handle = Some(thread::spawn(move || {
@@ -275,11 +364,13 @@ impl LauncherUi {
             self.state.downloader.download_running = false;
             match handle.join() {
                 Ok(Ok(version)) => {
+                    eprintln!("[download] GUI download worker finished: version={version}");
                     self.state.status_message = format!("Downloaded Minecraft {version}");
                     self.state.downloader.active_download = None;
                     self.refresh_installed_versions();
                 }
                 Ok(Err(error)) => {
+                    eprintln!("[download] GUI download worker failed: {error}");
                     self.state.status_message = format!("Download failed: {error}");
                     if self.state.downloader.download_error.is_none() {
                         self.state.downloader.download_error = Some(error);
@@ -287,6 +378,7 @@ impl LauncherUi {
                 }
                 Err(_) => {
                     let error = "download worker panicked".to_owned();
+                    eprintln!("[download] GUI download worker panicked");
                     self.state.status_message = format!("Download failed: {error}");
                     self.state.downloader.download_error = Some(error);
                 }
@@ -363,12 +455,20 @@ impl LauncherUi {
     }
 
     fn handle_save(&mut self) {
+        eprintln!(
+            "[launcher] Saving GUI settings to {}",
+            self.config_path.display()
+        );
         match self.save_config() {
             Ok(()) => {
+                eprintln!("[launcher] GUI settings saved");
                 self.state.status_message =
                     format!("Saved settings to {}", self.config_path.display())
             }
-            Err(error) => self.state.status_message = format!("Save failed: {error}"),
+            Err(error) => {
+                eprintln!("[launcher] GUI settings save failed: {error}");
+                self.state.status_message = format!("Save failed: {error}");
+            }
         }
     }
 
@@ -610,7 +710,11 @@ impl LauncherApp {
 impl eframe::App for LauncherApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.ui.pump_download_events();
-        if self.ui.state.downloader.download_running {
+        if self.ui.pump_game_events() {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+        }
+        if self.ui.state.downloader.download_running || self.ui.game_running() {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
 
@@ -650,9 +754,9 @@ impl eframe::App for LauncherApp {
                 if ui
                     .add_enabled(can_play, egui::Button::new("Play"))
                     .clicked()
-                    && self.ui.handle_play()
+                    && self.ui.handle_play(ctx.clone())
                 {
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
                 }
                 if ui.button("Downloader").clicked() {
                     self.ui.state.downloader.open = true;

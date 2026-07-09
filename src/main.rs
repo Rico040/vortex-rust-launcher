@@ -24,25 +24,51 @@ fn main() {
 }
 
 fn run() -> io::Result<()> {
-    let mut config = config::LauncherConfig::load_default().unwrap_or_default();
+    eprintln!("[launcher] Starting Vortex Minecraft Launcher");
+    let mut config = match config::LauncherConfig::load_default() {
+        Ok(config) => {
+            eprintln!(
+                "[launcher] Loaded configuration from {}",
+                config::DEFAULT_CONFIG_FILE
+            );
+            config
+        }
+        Err(error) => {
+            eprintln!(
+                "[launcher] Could not load {}: {error}; using platform defaults",
+                config::DEFAULT_CONFIG_FILE
+            );
+            config::LauncherConfig::default()
+        }
+    };
+    log_config_summary(&config);
     let mut args = std::env::args().skip(1);
     match args.next().as_deref() {
-        Some("versions") => list_versions(config.show_all_versions),
+        Some("versions") => {
+            eprintln!("[launcher] Command: versions");
+            list_versions(config.show_all_versions)
+        }
         Some("download") => {
             let version = args
                 .next()
                 .or_else(|| config.selected_version.clone())
                 .unwrap_or_else(|| "latest".to_owned());
+            eprintln!("[launcher] Command: download {version}");
             config.selected_version =
                 Some(resolve_latest_alias(&version, config.show_all_versions)?);
             download_selected_version(&config)
         }
         Some("set") => {
+            eprintln!("[launcher] Command: set");
             apply_setting(&mut config, args.collect::<Vec<_>>())?;
             config.save_default()
         }
-        Some("launch") => launch_selected_version(&config),
+        Some("launch") => {
+            eprintln!("[launcher] Command: launch");
+            launch_selected_version(&config)
+        }
         Some("help") | Some("--help") | Some("-h") => {
+            eprintln!("[launcher] Command: help");
             print_help();
             Ok(())
         }
@@ -51,6 +77,7 @@ fn run() -> io::Result<()> {
             format!("unknown command '{other}'. Run with 'help' for usage."),
         )),
         None => {
+            eprintln!("[launcher] Command: gui");
             let runtime = platform::RuntimeEnvironment::detect();
             let profile = minecraft::LaunchProfile::from_config(&config);
             let download_plan = download::DownloadPlan::for_profile(&profile);
@@ -88,6 +115,13 @@ fn download_selected_version(config: &config::LauncherConfig) -> io::Result<()> 
 
 fn launch_selected_version(config: &config::LauncherConfig) -> io::Result<()> {
     let profile = minecraft::LaunchProfile::from_config(config);
+    eprintln!(
+        "[launcher] Launch profile: version={}, player={}, game_dir={}, memory={}M",
+        profile.version_id,
+        profile.username,
+        profile.game_directory.display(),
+        profile.memory_mb
+    );
     let command = profile.launch_command(config.save_launch_string)?;
     let outcome = launch::launch_minecraft(
         &command,
@@ -131,6 +165,7 @@ fn apply_setting(config: &mut config::LauncherConfig, args: Vec<String>) -> io::
             ))
         }
     }
+    eprintln!("[launcher] Updated setting {}", args[0]);
     Ok(())
 }
 
@@ -142,6 +177,7 @@ fn resolve_latest_alias(version: &str, include_snapshots: bool) -> io::Result<St
     if version != "latest" {
         return Ok(version.to_owned());
     }
+    eprintln!("[launcher] Resolving latest version alias; include_snapshots={include_snapshots}");
     fetch_manifest(include_snapshots)?
         .into_iter()
         .next()
@@ -150,6 +186,7 @@ fn resolve_latest_alias(version: &str, include_snapshots: bool) -> io::Result<St
 }
 
 fn fetch_manifest(include_snapshots: bool) -> io::Result<Vec<download::ManifestVersion>> {
+    eprintln!("[launcher] Fetching version manifest with curl");
     let output = Command::new("curl")
         .args([
             "--fail",
@@ -165,5 +202,30 @@ fn fetch_manifest(include_snapshots: bool) -> io::Result<Vec<download::ManifestV
             String::from_utf8_lossy(&output.stderr)
         )));
     }
-    download::parse_versions_manifest(&String::from_utf8_lossy(&output.stdout), include_snapshots)
+    let versions = download::parse_versions_manifest(
+        &String::from_utf8_lossy(&output.stdout),
+        include_snapshots,
+    )?;
+    eprintln!("[launcher] Parsed {} manifest versions", versions.len());
+    Ok(versions)
+}
+
+fn log_config_summary(config: &config::LauncherConfig) {
+    eprintln!(
+        "[launcher] Config summary: version={}, player={}, game_dir={}, memory={}M, custom_java={}, custom_jvm_args={}, extra_game_args={}, download_threads={}, snapshots={}, redownload_all={}",
+        config.selected_version.as_deref().unwrap_or("latest"),
+        config.username.as_deref().unwrap_or("Player"),
+        config
+            .game_directory
+            .as_ref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| ".minecraft".to_owned()),
+        config.memory_mb.unwrap_or(2048),
+        config.use_custom_java,
+        config.extra_jvm_args.len(),
+        config.extra_game_args.len(),
+        config.download_threads,
+        config.show_all_versions,
+        config.redownload_all_files
+    );
 }

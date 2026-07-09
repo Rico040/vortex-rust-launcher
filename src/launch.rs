@@ -26,6 +26,7 @@ pub struct LaunchOutcome {
 #[derive(Debug)]
 pub struct JavaValidation {
     pub status: ExitStatus,
+    pub stdout: String,
     pub stderr: String,
 }
 
@@ -33,9 +34,14 @@ pub fn launch_minecraft(
     command: &LaunchCommand,
     options: LaunchOptions,
 ) -> io::Result<LaunchOutcome> {
-    validate_java(command)?;
+    let validation = validate_java(command)?;
     let display_command = options.save_launch_string.then(|| display_command(command));
+    log_launch_plan(command, &validation);
     let child = minecraft_process(command).spawn()?;
+    eprintln!(
+        "[launcher] Minecraft process started with pid {}",
+        child.id()
+    );
 
     Ok(LaunchOutcome {
         child,
@@ -59,6 +65,7 @@ pub fn validate_java(command: &LaunchCommand) -> io::Result<JavaValidation> {
 
     Ok(JavaValidation {
         status: output.status,
+        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
         stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
     })
 }
@@ -86,6 +93,31 @@ fn minecraft_process(command: &LaunchCommand) -> Command {
         .current_dir(&command.working_directory)
         .env_remove(JAVA_OPTIONS_ENV);
     process
+}
+
+fn log_launch_plan(command: &LaunchCommand, validation: &JavaValidation) {
+    eprintln!("[launcher] Preparing Minecraft launch");
+    eprintln!(
+        "[launcher] Java executable: {}",
+        command.executable.display()
+    );
+    eprintln!(
+        "[launcher] Working directory: {}",
+        command.working_directory.display()
+    );
+    eprintln!("[launcher] Java validation status: {}", validation.status);
+    if let Some(version) = first_non_empty_line(&validation.stderr)
+        .or_else(|| first_non_empty_line(&validation.stdout))
+    {
+        eprintln!("[launcher] Java version: {version}");
+    }
+    eprintln!("[launcher] Launch argument count: {}", command.args.len());
+    eprintln!("[launcher] Launch command: {}", display_command(command));
+    eprintln!("[launcher] Environment override: {JAVA_OPTIONS_ENV} removed");
+}
+
+fn first_non_empty_line(value: &str) -> Option<&str> {
+    value.lines().map(str::trim).find(|line| !line.is_empty())
 }
 
 fn command_to_string(executable: &Path, args: &[String]) -> String {

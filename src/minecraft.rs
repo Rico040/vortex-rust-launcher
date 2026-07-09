@@ -139,6 +139,7 @@ pub struct VersionDownloads {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct DownloadInfo {
+    pub id: Option<String>,
     pub sha1: Option<String>,
     pub size: Option<u64>,
     pub url: Option<String>,
@@ -342,6 +343,12 @@ impl MinecraftVersionJson {
         save_launch_string: bool,
         context: &LaunchContext,
     ) -> LaunchCommand {
+        eprintln!(
+            "[launcher] Building launch command: profile_version={}, metadata_id={}, required_java={}",
+            profile.version_id,
+            self.id.as_deref().unwrap_or("<missing>"),
+            self.required_java_major()
+        );
         let java = profile
             .java_path
             .clone()
@@ -358,6 +365,7 @@ impl MinecraftVersionJson {
             self.effective_libraries_with_context(&profile.game_directory, context),
             &version_jar,
         );
+        let classpath_entries = classpath.split(classpath_separator()).count();
         let natives_dir = profile
             .game_directory
             .join("versions")
@@ -370,6 +378,14 @@ impl MinecraftVersionJson {
             .or(self.assets.as_deref())
             .unwrap_or(version_id);
         let main_class = self.main_class.clone().unwrap_or_default();
+        eprintln!(
+            "[launcher] Launch metadata: version_id={version_id}, jar_id={jar_id}, main_class={}, assets_index={assets_index}, classpath_entries={classpath_entries}",
+            if main_class.is_empty() {
+                "<missing>"
+            } else {
+                &main_class
+            }
+        );
 
         let mut replacements = BTreeMap::new();
         replacements.insert("auth_player_name", profile.username.clone());
@@ -385,6 +401,8 @@ impl MinecraftVersionJson {
         replacements.insert("assets_index_name", assets_index.to_owned());
         replacements.insert("auth_uuid", offline_uuid(&profile.username));
         replacements.insert("auth_access_token", "0".to_owned());
+        replacements.insert("user_properties", "{}".to_owned());
+        replacements.insert("user_property_map", "{}".to_owned());
         replacements.insert("user_type", "legacy".to_owned());
         replacements.insert("version_type", "release".to_owned());
         replacements.insert("launcher_name", LAUNCHER_NAME.to_owned());
@@ -421,8 +439,18 @@ impl MinecraftVersionJson {
             );
         }
         if let Some(logging) = &self.logging {
-            if let Some(argument) = logging.client.as_ref().and_then(|c| c.argument.as_ref()) {
-                args.push(replace_placeholders(argument, &replacements));
+            if let Some(client) = logging.client.as_ref() {
+                if let Some(file) = client.file.as_ref() {
+                    replacements.insert(
+                        "path",
+                        logging_config_path(&profile.game_directory, file)
+                            .display()
+                            .to_string(),
+                    );
+                }
+                if let Some(argument) = client.argument.as_ref() {
+                    args.push(replace_placeholders(argument, &replacements));
+                }
             }
         }
         if !main_class.is_empty() {
@@ -439,6 +467,11 @@ impl MinecraftVersionJson {
         }
         args.extend(profile.game_args.clone());
         let launch_string = save_launch_string.then(|| command_to_string(&java, &args));
+        eprintln!(
+            "[launcher] Launch arguments built: jvm_args={}, total_args={}, save_launch_string={save_launch_string}",
+            profile.jvm_args.len(),
+            args.len()
+        );
         LaunchCommand {
             executable: java,
             args,
@@ -476,8 +509,14 @@ impl MinecraftVersionJson {
             .join("versions")
             .join(version_id)
             .join("natives");
+        eprintln!(
+            "[launcher] Extracting native libraries for version {version_id} into {}",
+            natives_dir.display()
+        );
         fs::create_dir_all(&natives_dir)?;
         let libraries_dir = profile.game_directory.join("libraries");
+        let mut extracted = 0_usize;
+        let mut missing = 0_usize;
         for library in self
             .libraries
             .iter()
@@ -496,8 +535,18 @@ impl MinecraftVersionJson {
             let archive = libraries_dir.join(native_path);
             if archive.exists() {
                 extract_native_archive(&archive, &natives_dir, library.extract.as_ref())?;
+                extracted += 1;
+            } else {
+                missing += 1;
+                eprintln!(
+                    "[launcher] Native archive missing, skipping extraction: {}",
+                    archive.display()
+                );
             }
         }
+        eprintln!(
+            "[launcher] Native extraction finished: extracted={extracted}, missing={missing}"
+        );
         Ok(())
     }
 }
@@ -628,7 +677,17 @@ impl LaunchProfile {
     }
 
     pub fn launch_command(&self, save_launch_string: bool) -> io::Result<LaunchCommand> {
+        eprintln!(
+            "[launcher] Loading version metadata: version={}, game_dir={}",
+            self.version_id,
+            self.game_directory.display()
+        );
         let metadata = MinecraftVersionJson::load_resolved(&self.game_directory, &self.version_id)?;
+        eprintln!(
+            "[launcher] Loaded version metadata: id={}, libraries={}",
+            metadata.id.as_deref().unwrap_or("<missing>"),
+            metadata.libraries.len()
+        );
         metadata.extract_native_libraries(self)?;
         Ok(metadata.build_launch_command(self, save_launch_string))
     }
@@ -780,6 +839,19 @@ fn build_classpath(libraries: Vec<Library>, version_jar: &Path) -> String {
     entries.join(classpath_separator())
 }
 
+pub fn logging_config_path(game_directory: impl AsRef<Path>, file: &DownloadInfo) -> PathBuf {
+    game_directory
+        .as_ref()
+        .join("assets")
+        .join("log_configs")
+        .join(
+            file.id
+                .as_deref()
+                .or_else(|| file.url.as_deref().and_then(|url| url.rsplit('/').next()))
+                .unwrap_or("client-logging.xml"),
+        )
+}
+
 fn classpath_separator() -> &'static str {
     if cfg!(windows) {
         ";"
@@ -875,6 +947,51 @@ mod tests {
         assert!(command.args.contains(&"--username".to_owned()));
         assert!(!command.args.contains(&"--demo".to_owned()));
         assert!(!command.args.contains(&"--width".to_owned()));
+    }
+
+    #[test]
+    fn legacy_1_8_9_arguments_do_not_keep_unresolved_placeholders() {
+        let version: MinecraftVersionJson = serde_json::from_str(
+            r#"{
+                "id": "1.8.9",
+                "javaVersion": { "component": "jre-legacy", "majorVersion": 8 },
+                "assets": "1.8",
+                "assetIndex": { "id": "1.8", "url": "https://example/assets.json" },
+                "mainClass": "net.minecraft.client.main.Main",
+                "minecraftArguments": "--username ${auth_player_name} --version ${version_name} --gameDir ${game_directory} --assetsDir ${assets_root} --assetIndex ${assets_index_name} --uuid ${auth_uuid} --accessToken ${auth_access_token} --userProperties ${user_properties} --userType ${user_type}",
+                "logging": {
+                    "client": {
+                        "argument": "-Dlog4j.configurationFile=${path}",
+                        "file": {
+                            "id": "client-1.7.xml",
+                            "url": "https://launcher.mojang.com/v1/objects/hash/client-1.7.xml"
+                        }
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let command =
+            version.build_launch_command_with_context(&profile(), false, &linux_context());
+
+        assert!(
+            command.args.iter().all(|arg| !arg.contains("${")),
+            "{:?}",
+            command.args
+        );
+        assert!(command
+            .args
+            .windows(2)
+            .any(|pair| pair == ["--userProperties", "{}"]));
+        assert!(command.args.contains(&format!(
+            "-Dlog4j.configurationFile={}",
+            PathBuf::from(".minecraft")
+                .join("assets")
+                .join("log_configs")
+                .join("client-1.7.xml")
+                .display()
+        )));
     }
 
     #[test]

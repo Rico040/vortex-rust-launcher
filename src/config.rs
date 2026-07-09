@@ -67,9 +67,14 @@ impl LauncherConfig {
         let defaults = current_platform_defaults();
         let path = path.as_ref();
         if !path.exists() {
+            eprintln!(
+                "[launcher] Configuration file not found, using defaults: {}",
+                path.display()
+            );
             return Ok(Self::with_platform_defaults(&defaults));
         }
 
+        eprintln!("[launcher] Reading configuration: {}", path.display());
         Self::from_str_with_defaults(&fs::read_to_string(path)?, &defaults)
     }
 
@@ -82,6 +87,8 @@ impl LauncherConfig {
     }
 
     pub fn save(&self, path: impl AsRef<Path>) -> io::Result<()> {
+        let path = path.as_ref();
+        eprintln!("[launcher] Writing configuration: {}", path.display());
         let mut file = fs::File::create(path)?;
         file.write_all(self.to_config_string().as_bytes())
     }

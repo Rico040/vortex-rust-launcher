@@ -313,8 +313,17 @@ pub fn download_selected_version(
     sender: mpsc::Sender<DownloadEvent>,
 ) -> io::Result<String> {
     let profile = LaunchProfile::from_config(config);
+    eprintln!(
+        "[download] Starting selected-version download: requested_version={}, game_dir={}, threads={}, redownload_all={}, snapshots={}",
+        profile.version_id,
+        profile.game_directory.display(),
+        config.download_threads,
+        config.redownload_all_files,
+        config.show_all_versions
+    );
     let manifest = fetch_manifest(config.show_all_versions)?;
     let version = resolve_selected_version(&manifest, &profile.version_id);
+    eprintln!("[download] Resolved version: {version}");
     let game_dir = &profile.game_directory;
     fs::create_dir_all(game_dir)?;
 
@@ -356,6 +365,10 @@ pub fn download_selected_version(
     if let Some(job) = logging_config_job(&version_json, game_dir) {
         jobs.push(job);
     }
+    eprintln!(
+        "[download] Queued core files: {} jobs before assets",
+        jobs.len()
+    );
     run_jobs(jobs, config, &sender)?;
 
     if let Some(index_id) = version_json
@@ -369,6 +382,7 @@ pub fn download_selected_version(
             .join(format!("{index_id}.json"));
         if index_path.exists() {
             let assets = assets_to_resources(&fs::read_to_string(index_path)?, game_dir)?;
+            eprintln!("[download] Queued asset objects: {} jobs", assets.len());
             run_jobs(
                 assets.into_iter().map(|asset| asset.download).collect(),
                 config,
@@ -385,9 +399,17 @@ fn run_jobs(
     config: &LauncherConfig,
     sender: &mpsc::Sender<DownloadEvent>,
 ) -> io::Result<()> {
+    let original_count = jobs.len();
     let jobs = dedupe_jobs_by_destination(jobs);
     if jobs.is_empty() {
+        eprintln!("[download] No jobs to run");
         return Ok(());
+    }
+    if jobs.len() != original_count {
+        eprintln!(
+            "[download] Deduplicated jobs by destination: {original_count} -> {}",
+            jobs.len()
+        );
     }
     let options = DownloadOptions {
         mode: if config.redownload_all_files {
@@ -399,7 +421,16 @@ fn run_jobs(
         max_parallel_downloads: config.download_threads,
         async_download: false,
     };
+    eprintln!(
+        "[download] Running {} jobs with concurrency {}",
+        jobs.len(),
+        options.max_parallel_downloads.max(1)
+    );
     let summary = execute_downloads(jobs, options.max_parallel_downloads, sender.clone());
+    eprintln!(
+        "[download] Jobs finished: succeeded={}, failed={}",
+        summary.succeeded, summary.failed
+    );
     if summary.failed == 0 {
         Ok(())
     } else {
@@ -418,6 +449,7 @@ fn dedupe_jobs_by_destination(jobs: Vec<DownloadJob>) -> Vec<DownloadJob> {
 }
 
 fn fetch_manifest(include_snapshots: bool) -> io::Result<Vec<ManifestVersion>> {
+    eprintln!("[download] Fetching Mojang version manifest");
     let manifest = ureq::AgentBuilder::new()
         .timeout(Duration::from_secs(30))
         .build()
@@ -426,7 +458,9 @@ fn fetch_manifest(include_snapshots: bool) -> io::Result<Vec<ManifestVersion>> {
         .map_err(|error| io::Error::other(error.to_string()))?
         .into_string()
         .map_err(|error| io::Error::other(error.to_string()))?;
-    parse_versions_manifest(&manifest, include_snapshots)
+    let versions = parse_versions_manifest(&manifest, include_snapshots)?;
+    eprintln!("[download] Manifest versions available: {}", versions.len());
+    Ok(versions)
 }
 
 #[derive(Debug, Deserialize)]
@@ -524,10 +558,7 @@ pub fn logging_config_job(
         DownloadJob::new(
             DownloadKind::LogConfig,
             url,
-            game_dir
-                .join("assets")
-                .join("log_configs")
-                .join(url.rsplit('/').next().unwrap_or("client-logging.xml")),
+            crate::minecraft::logging_config_path(game_dir, file),
             "client logging config",
         )
         .with_integrity(file.sha1.clone(), file.size),
@@ -681,6 +712,10 @@ pub fn execute_downloads(
     sender: mpsc::Sender<DownloadEvent>,
 ) -> DownloadSummary {
     let total = jobs.len();
+    eprintln!(
+        "[download] Download executor started: total={total}, concurrency={}",
+        concurrency.max(1)
+    );
     let _ = sender.send(DownloadEvent::Started { total });
     let queue = Arc::new(Mutex::new(
         jobs.into_iter().enumerate().collect::<VecDeque<_>>(),
@@ -699,8 +734,21 @@ pub fn execute_downloads(
                 index,
                 label: job.label.clone(),
             });
+            eprintln!(
+                "[download] Starting job {}/{}: {} -> {}",
+                index + 1,
+                total,
+                job.label,
+                job.destination.display()
+            );
             match download_with_retries(&job, index, &sender) {
                 Ok(()) => {
+                    eprintln!(
+                        "[download] Finished job {}/{}: {}",
+                        index + 1,
+                        total,
+                        job.label
+                    );
                     let _ = sender.send(DownloadEvent::JobFinished {
                         index,
                         destination: job.destination,
@@ -708,6 +756,12 @@ pub fn execute_downloads(
                     let _ = done_tx.send(true);
                 }
                 Err(error) => {
+                    eprintln!(
+                        "[download] Failed job {}/{}: {}: {error}",
+                        index + 1,
+                        total,
+                        job.label
+                    );
                     let _ = sender.send(DownloadEvent::JobFailed {
                         index,
                         label: job.label,
@@ -734,6 +788,10 @@ pub fn execute_downloads(
         succeeded: summary.succeeded,
         failed: summary.failed,
     });
+    eprintln!(
+        "[download] Download executor finished: succeeded={}, failed={}",
+        summary.succeeded, summary.failed
+    );
     summary
 }
 
@@ -747,6 +805,10 @@ fn download_with_retries(
         match download_one_attempt(job, index, sender) {
             Ok(()) => return Ok(()),
             Err(error) if attempt < MAX_DOWNLOAD_ATTEMPTS && error.is_retryable() => {
+                eprintln!(
+                    "[download] Retrying job {} after attempt {attempt}/{MAX_DOWNLOAD_ATTEMPTS}: {error}",
+                    job.label
+                );
                 let _ = fs::remove_file(job.destination.with_extension("download"));
                 last_error = Some(error);
                 let backoff_ms = 500 * attempt as u64;
