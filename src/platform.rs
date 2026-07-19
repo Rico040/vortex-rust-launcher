@@ -120,7 +120,7 @@ pub fn current_platform_defaults() -> PlatformDefaults {
         default_java_executable_path: configured_java_path()
             .or_else(discover_windows_java)
             .unwrap_or_else(|| PathBuf::from(r"C:\jre8\bin\javaw.exe")),
-        default_ram_mb: 2500,
+        default_ram_mb: 2048,
         default_download_threads: 20,
         default_async_download: true,
         default_download_missing_libraries: true,
@@ -135,7 +135,7 @@ pub fn current_platform_defaults() -> PlatformDefaults {
         working_directory: executable_directory(),
         default_java_executable_path: configured_java_path()
             .unwrap_or_else(|| PathBuf::from("java")),
-        default_ram_mb: 2500,
+        default_ram_mb: 2048,
         default_download_threads: 20,
         default_async_download: true,
         default_download_missing_libraries: true,
@@ -157,7 +157,7 @@ pub fn current_platform_defaults() -> PlatformDefaults {
         default_java_executable_path: configured_java_path()
             .or_else(discover_macos_java)
             .unwrap_or_else(|| PathBuf::from("java")),
-        default_ram_mb: 700,
+        default_ram_mb: 1024,
         default_download_threads: 10,
         default_async_download: false,
         default_download_missing_libraries: false,
@@ -172,7 +172,7 @@ pub fn current_platform_defaults() -> PlatformDefaults {
         working_directory: executable_directory(),
         default_java_executable_path: configured_java_path()
             .unwrap_or_else(|| PathBuf::from("java")),
-        default_ram_mb: 2500,
+        default_ram_mb: 2048,
         default_download_threads: 20,
         default_async_download: true,
         default_download_missing_libraries: true,
