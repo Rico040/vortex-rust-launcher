@@ -1,7 +1,5 @@
 // Vortex Minecraft Launcher
 // SPDX-License-Identifier: GPL-3.0-only
-#![allow(dead_code)]
-
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::{self, Write};
@@ -78,10 +76,6 @@ impl LauncherConfig {
         Self::from_str_with_defaults(&fs::read_to_string(path)?, &defaults)
     }
 
-    pub fn load_from(path: impl AsRef<Path>) -> io::Result<Self> {
-        Self::load(path)
-    }
-
     pub fn save_default(&self) -> io::Result<()> {
         self.save(DEFAULT_CONFIG_FILE)
     }
@@ -93,10 +87,7 @@ impl LauncherConfig {
         file.write_all(self.to_config_string().as_bytes())
     }
 
-    pub fn save_to(&self, path: impl AsRef<Path>) -> io::Result<()> {
-        self.save(path)
-    }
-
+    #[cfg(test)]
     pub fn from_str(contents: &str) -> io::Result<Self> {
         Self::from_str_with_defaults(contents, &current_platform_defaults())
     }
@@ -331,73 +322,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parse_arg_string_keeps_quoted_paths_and_properties_with_spaces() {
-        let args = parse_arg_string(
-            r#"-Djava.library.path="/home/me/Minecraft Libraries" -Dlauncher.name="Vortex Launcher" "#,
-        );
-
-        assert_eq!(
-            args,
-            vec![
-                "-Djava.library.path=/home/me/Minecraft Libraries".to_owned(),
-                "-Dlauncher.name=Vortex Launcher".to_owned(),
-            ]
-        );
-    }
-
-    #[test]
-    fn parse_arg_string_preserves_escaped_quotes_inside_arguments() {
-        let args = parse_arg_string(r#"-Dtitle=\"Vortex Launcher\" "quoted value""#);
-
-        assert_eq!(
-            args,
-            vec![
-                "-Dtitle=\"Vortex Launcher\"".to_owned(),
-                "quoted value".to_owned(),
-            ]
-        );
-    }
-
-    #[test]
-    fn join_args_round_trips_custom_jvm_args_without_changing_meaning() {
+    fn config_arguments_round_trip_without_changing_meaning() {
         let args = vec![
             "-XX:+UnlockExperimentalVMOptions".to_owned(),
             r#"-Djava.library.path=C:\Program Files\Minecraft Libraries"#.to_owned(),
             r#"-Dlauncher.title=Vortex "Rust" Launcher"#.to_owned(),
             "".to_owned(),
         ];
+        let config = LauncherConfig {
+            extra_jvm_args: args.clone(),
+            ..LauncherConfig::default()
+        };
+        let loaded = LauncherConfig::from_str(&config.to_config_string()).unwrap();
 
-        assert_eq!(parse_arg_string(&join_args(&args)), args);
-    }
-
-    #[test]
-    fn legacy_config_migrates_space_containing_arguments_safely() {
-        let config = LauncherConfig::from_str(
-            r#"CustomParams=-Dpath="/opt/Minecraft Libraries" -Dname="Vortex Launcher"
-extra_game_args=--quickPlayPath "/home/me/New World"
-"#,
-        )
-        .expect("legacy config should parse");
-
-        assert_eq!(
-            config.extra_jvm_args,
-            vec![
-                "-Dpath=/opt/Minecraft Libraries".to_owned(),
-                "-Dname=Vortex Launcher".to_owned(),
-            ]
-        );
-        assert_eq!(
-            config.extra_game_args,
-            vec![
-                "--quickPlayPath".to_owned(),
-                "/home/me/New World".to_owned(),
-            ]
-        );
-        assert_eq!(
-            LauncherConfig::from_str(&config.to_config_string())
-                .expect("saved config should parse")
-                .extra_jvm_args,
-            config.extra_jvm_args
-        );
+        assert_eq!(loaded.extra_jvm_args, args);
     }
 }

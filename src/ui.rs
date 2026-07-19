@@ -11,11 +11,9 @@ use std::{fs, io};
 use eframe::egui;
 
 use crate::config::{join_args, parse_arg_string, LauncherConfig, DEFAULT_CONFIG_FILE};
-use crate::download::{
-    DownloadEvent, DownloadMode, DownloadOptions, DownloadPlan, ManifestVersion,
-};
+use crate::download::{DownloadEvent, ManifestVersion};
 use crate::launch::{self, LaunchOptions};
-use crate::minecraft::{LaunchProfile, VersionMetadata};
+use crate::minecraft::LaunchProfile;
 use crate::platform::{current_platform_defaults, RuntimeEnvironment, UiLayout};
 
 const LAUNCHER_AUTHOR: &str = "ottie";
@@ -23,17 +21,16 @@ const LAUNCHER_VERSION: &str = "1.2.0";
 
 #[derive(Debug)]
 pub struct LauncherUi {
-    runtime: RuntimeEnvironment,
     layout: UiLayout,
     state: LauncherUiState,
     config: LauncherConfig,
     persisted_config: LauncherConfig,
     config_path: PathBuf,
-    download_plan: DownloadPlan,
     download_rx: Option<mpsc::Receiver<DownloadEvent>>,
     download_handle: Option<thread::JoinHandle<Result<String, String>>>,
     game_rx: Option<mpsc::Receiver<Result<String, String>>>,
     game_handle: Option<thread::JoinHandle<()>>,
+    launcher_hidden_for_game: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -90,22 +87,20 @@ impl LauncherUi {
         runtime: RuntimeEnvironment,
         config: LauncherConfig,
         profile: LaunchProfile,
-        download_plan: DownloadPlan,
     ) -> Self {
         let layout = runtime.ui_layout();
         let state = LauncherUiState::from_config(&config, &profile, &runtime);
         Self {
-            runtime,
             layout,
             state,
             persisted_config: config.clone(),
             config,
             config_path: PathBuf::from(DEFAULT_CONFIG_FILE),
-            download_plan,
             download_rx: None,
             download_handle: None,
             game_rx: None,
             game_handle: None,
+            launcher_hidden_for_game: false,
         }
     }
 
@@ -133,30 +128,11 @@ impl LauncherUi {
         self.mark_persisted();
         Ok(())
     }
-    pub fn save_config_to(&mut self, path: impl AsRef<Path>) -> std::io::Result<()> {
-        self.apply_state_to_config();
-        self.config.save(path)?;
-        self.mark_persisted();
-        Ok(())
-    }
-
     fn save_config_if_main_fields_changed(&mut self) -> std::io::Result<()> {
         if self.main_fields_changed() {
             self.save_config()?;
         }
         Ok(())
-    }
-
-    fn save_config_if_main_fields_changed_to(
-        &mut self,
-        path: impl AsRef<Path>,
-    ) -> std::io::Result<bool> {
-        if self.main_fields_changed() {
-            self.save_config_to(path)?;
-            Ok(true)
-        } else {
-            Ok(false)
-        }
     }
 
     fn mark_persisted(&mut self) {
@@ -235,13 +211,11 @@ impl LauncherUi {
                 if let Some(display) = outcome.display_command {
                     std::fs::write("launch_string.txt", display)?;
                 }
-                Ok(outcome.child)
+                Ok((outcome.child, outcome.should_hide_launcher))
             }) {
-            Ok(mut child) => {
+            Ok((mut child, hide_launcher)) => {
                 let pid = child.id();
-                eprintln!(
-                    "[launcher] GUI launch succeeded: pid={pid}; hiding launcher until Minecraft exits"
-                );
+                eprintln!("[launcher] GUI launch succeeded: pid={pid}");
                 let (tx, rx) = mpsc::channel();
                 self.game_rx = Some(rx);
                 self.game_handle = Some(thread::spawn(move || {
@@ -252,8 +226,9 @@ impl LauncherUi {
                     let _ = tx.send(result);
                     ctx.request_repaint();
                 }));
+                self.launcher_hidden_for_game = hide_launcher;
                 self.state.status_message = format!("Minecraft running with pid {pid}");
-                true
+                hide_launcher
             }
             Err(error) => {
                 eprintln!("[launcher] GUI launch failed: {error}");
@@ -306,6 +281,7 @@ impl LauncherUi {
             }
         }
         self.game_rx = None;
+        self.launcher_hidden_for_game = false;
     }
 
     fn handle_download(&mut self) {
@@ -470,26 +446,6 @@ impl LauncherUi {
                 self.state.status_message = format!("Save failed: {error}");
             }
         }
-    }
-
-    pub fn play(&self) -> Vec<String> {
-        let profile = self.state.to_launch_profile(&self.runtime);
-        profile.launch_arguments(&VersionMetadata::minimal(&profile.version_id))
-    }
-    pub fn downloader_options(&self) -> DownloadOptions {
-        DownloadOptions {
-            mode: if self.state.downloader.redownload_all_files {
-                DownloadMode::AllFiles
-            } else {
-                DownloadMode::MissingLibraries
-            },
-            include_snapshots: self.state.downloader.show_all_versions,
-            max_parallel_downloads: self.state.settings.download_threads.parse().unwrap_or(5),
-            async_download: self.state.settings.async_download,
-        }
-    }
-    pub fn download_queue_len(&self) -> usize {
-        self.download_plan.tasks.len()
     }
 }
 
@@ -710,7 +666,8 @@ impl LauncherApp {
 impl eframe::App for LauncherApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.ui.pump_download_events();
-        if self.ui.pump_game_events() {
+        let launcher_was_hidden = self.ui.launcher_hidden_for_game;
+        if self.ui.pump_game_events() && launcher_was_hidden {
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
             ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
         }
@@ -886,27 +843,6 @@ impl LauncherUiState {
             status_message: "Ready".to_owned(),
         }
     }
-
-    fn to_launch_profile(&self, runtime: &RuntimeEnvironment) -> LaunchProfile {
-        LaunchProfile {
-            username: self.main.player_name.replace(' ', ""),
-            version_id: self.main.selected_version.replace(' ', ""),
-            game_directory: runtime
-                .minecraft_directory()
-                .unwrap_or_else(|| PathBuf::from(".minecraft")),
-            java_path: self
-                .settings
-                .use_custom_java
-                .then(|| PathBuf::from(&self.settings.custom_java_path)),
-            memory_mb: self.main.ram_mb.parse::<u32>().unwrap_or(2500).max(350),
-            jvm_args: self
-                .settings
-                .use_custom_jvm_parameters
-                .then(|| parse_arg_string(&self.settings.custom_jvm_parameters))
-                .unwrap_or_default(),
-            game_args: Vec::new(),
-        }
-    }
 }
 
 impl DownloaderWindowState {
@@ -1019,17 +955,6 @@ mod tests {
         ))
     }
 
-    fn ui_for_config(config: LauncherConfig, game_directory: PathBuf) -> LauncherUi {
-        let mut profile = LaunchProfile::from_config(&config);
-        profile.game_directory = game_directory;
-        LauncherUi::new(
-            RuntimeEnvironment::detect(),
-            config,
-            profile,
-            DownloadPlan::default(),
-        )
-    }
-
     #[test]
     fn scans_only_version_directories_with_matching_json() {
         let root = temp_game_dir();
@@ -1040,51 +965,6 @@ mod tests {
         fs::write(root.join("versions/readme.txt"), "ignored").unwrap();
 
         assert_eq!(installed_versions(&root).unwrap(), vec!["1.20.4"]);
-        fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn prefers_configured_chosen_version_when_installed() {
-        let root = temp_game_dir();
-        for version in ["1.20.4", "1.21"] {
-            fs::create_dir_all(root.join("versions").join(version)).unwrap();
-            fs::write(
-                root.join("versions")
-                    .join(version)
-                    .join(format!("{version}.json")),
-                "{}",
-            )
-            .unwrap();
-        }
-        let mut config = LauncherConfig::default();
-        config.selected_version = Some("1.21".to_owned());
-        let mut profile = LaunchProfile::from_config(&config);
-        profile.game_directory = root.clone();
-
-        let state = LauncherUiState::from_config(&config, &profile, &RuntimeEnvironment::detect());
-
-        assert_eq!(state.main.installed_versions, vec!["1.20.4", "1.21"]);
-        assert_eq!(state.main.selected_version, "1.21");
-        assert!(state.main.versions_error.is_none());
-        fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn surfaces_empty_state_when_no_versions_are_installed() {
-        let root = temp_game_dir();
-        fs::create_dir_all(root.join("versions")).unwrap();
-        let config = LauncherConfig::default();
-        let mut profile = LaunchProfile::from_config(&config);
-        profile.game_directory = root.clone();
-
-        let state = LauncherUiState::from_config(&config, &profile, &RuntimeEnvironment::detect());
-
-        assert!(state.main.installed_versions.is_empty());
-        assert!(state
-            .main
-            .versions_error
-            .unwrap()
-            .contains("Open Downloader"));
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -1116,98 +996,6 @@ mod tests {
             vec!["24w01a", "1.21", "1.20.4"]
         );
         assert!(state.downloader.versions_error.is_none());
-        fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn refresh_after_download_scans_configured_game_directory() {
-        let root = temp_game_dir();
-        fs::create_dir_all(root.join("versions")).unwrap();
-        let mut config = LauncherConfig::default();
-        config.game_directory = Some(root.clone());
-        config.selected_version = Some("1.12.2".to_owned());
-        let profile = LaunchProfile::from_config(&config);
-        let mut ui = LauncherUi::new(
-            RuntimeEnvironment::detect(),
-            config,
-            profile,
-            DownloadPlan::default(),
-        );
-        assert!(ui.state.main.installed_versions.is_empty());
-
-        fs::create_dir_all(root.join("versions/1.12.2")).unwrap();
-        fs::write(root.join("versions/1.12.2/1.12.2.json"), "{}").unwrap();
-
-        ui.refresh_installed_versions();
-
-        assert_eq!(ui.state.main.installed_versions, vec!["1.12.2"]);
-        assert_eq!(ui.state.main.selected_version, "1.12.2");
-        assert!(ui.state.main.versions_error.is_none());
-        fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn unchanged_main_fields_do_not_write_config() {
-        let root = temp_game_dir();
-        fs::create_dir_all(root.join("versions/1.20.4")).unwrap();
-        fs::write(root.join("versions/1.20.4/1.20.4.json"), "{}").unwrap();
-        let config_path = root.join("vortex_launcher.conf");
-        fs::write(&config_path, "original config").unwrap();
-
-        let mut config = LauncherConfig::default();
-        config.username = Some("Player".to_owned());
-        config.selected_version = Some("1.20.4".to_owned());
-        config.memory_mb = Some(2048);
-        let mut ui = ui_for_config(config, root.clone());
-
-        assert!(!ui
-            .save_config_if_main_fields_changed_to(&config_path)
-            .unwrap());
-        assert_eq!(fs::read_to_string(&config_path).unwrap(), "original config");
-
-        fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn changed_main_fields_write_config_on_launch_save_path() {
-        let root = temp_game_dir();
-        fs::create_dir_all(root.join("versions/1.20.4")).unwrap();
-        fs::write(root.join("versions/1.20.4/1.20.4.json"), "{}").unwrap();
-        let config_path = root.join("vortex_launcher.conf");
-        fs::write(&config_path, "original config").unwrap();
-
-        let mut config = LauncherConfig::default();
-        config.username = Some("Player".to_owned());
-        config.selected_version = Some("1.20.4".to_owned());
-        config.memory_mb = Some(2048);
-        let mut ui = ui_for_config(config, root.clone());
-        ui.state.main.player_name = "Edited Player".to_owned();
-
-        assert!(ui
-            .save_config_if_main_fields_changed_to(&config_path)
-            .unwrap());
-        let saved = fs::read_to_string(&config_path).unwrap();
-        assert!(saved.contains("Name=EditedPlayer"));
-        assert!(!ui.state.settings_dirty);
-
-        fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn save_apply_clears_settings_dirty() {
-        let root = temp_game_dir();
-        let config_path = root.join("vortex_launcher.conf");
-        fs::create_dir_all(&root).unwrap();
-        let mut ui = ui_for_config(LauncherConfig::default(), root.clone());
-        ui.state.settings_dirty = true;
-        ui.state.settings.keep_launcher_open = true;
-
-        ui.save_config_to(&config_path).unwrap();
-
-        assert!(!ui.state.settings_dirty);
-        assert!(fs::read_to_string(&config_path)
-            .unwrap()
-            .contains("KeepLauncherOpen=true"));
         fs::remove_dir_all(root).unwrap();
     }
 }

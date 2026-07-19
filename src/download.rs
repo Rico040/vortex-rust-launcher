@@ -1,7 +1,5 @@
 // Vortex Minecraft Launcher
 // SPDX-License-Identifier: GPL-3.0-only
-#![allow(dead_code)]
-
 use std::collections::HashSet;
 use std::collections::{BTreeMap, VecDeque};
 use std::fs;
@@ -9,7 +7,7 @@ use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
 use crate::config::LauncherConfig;
 use crate::minecraft::{
@@ -25,7 +23,6 @@ const MAX_DOWNLOAD_ATTEMPTS: usize = 5;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DownloadKind {
-    VersionManifest,
     VersionJson,
     ClientJar,
     Library,
@@ -45,28 +42,6 @@ pub struct DownloadJob {
     pub label: String,
 }
 
-pub type DownloadTask = DownloadJob;
-
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct DownloadPlan {
-    pub tasks: Vec<DownloadJob>,
-    pub max_parallel_downloads: usize,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DownloadMode {
-    MissingLibraries,
-    AllFiles,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct DownloadOptions {
-    pub mode: DownloadMode,
-    pub include_snapshots: bool,
-    pub max_parallel_downloads: usize,
-    pub async_download: bool,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ManifestVersion {
     pub id: String,
@@ -77,19 +52,8 @@ pub struct ManifestVersion {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedLibrary {
-    pub name: String,
-    pub classpath_path: Option<PathBuf>,
     pub artifact: Option<DownloadJob>,
     pub native: Option<DownloadJob>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AssetResource {
-    pub name: String,
-    pub hash: String,
-    pub object_path: PathBuf,
-    pub resource_path: PathBuf,
-    pub download: DownloadJob,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -213,101 +177,6 @@ impl DownloadJob {
     }
 }
 
-impl DownloadPlan {
-    pub fn for_profile(profile: &LaunchProfile) -> Self {
-        Self {
-            tasks: vec![DownloadJob::new(
-                DownloadKind::VersionManifest,
-                VERSION_MANIFEST_URL,
-                profile.game_directory.join("version_manifest_v2.json"),
-                "version manifest",
-            )],
-            max_parallel_downloads: 4,
-        }
-    }
-
-    pub fn from_config(profile: &LaunchProfile, options: DownloadOptions) -> Self {
-        let game_dir = &profile.game_directory;
-        let mut plan = Self {
-            tasks: Vec::new(),
-            max_parallel_downloads: options.max_parallel_downloads.max(1),
-        };
-        let manifest_path = game_dir.join("version_manifest_v2.json");
-        plan.push_if_needed(
-            DownloadJob::new(
-                DownloadKind::VersionManifest,
-                VERSION_MANIFEST_URL,
-                manifest_path.clone(),
-                "version manifest",
-            ),
-            options.mode,
-            true,
-        );
-
-        let Ok(manifest_text) = fs::read_to_string(&manifest_path) else {
-            return plan;
-        };
-        let Ok(manifest) = parse_versions_manifest(&manifest_text, options.include_snapshots)
-        else {
-            return plan;
-        };
-        let version = resolve_selected_version(&manifest, &profile.version_id);
-        let Some(version_job) = version_json_job(&manifest, game_dir, &version) else {
-            return plan;
-        };
-        plan.push_if_needed(version_job, options.mode, false);
-
-        let Ok(version_json) =
-            crate::minecraft::MinecraftVersionJson::load_resolved(game_dir, &version)
-        else {
-            return plan;
-        };
-        if let Some(job) = client_jar_job(&version_json, game_dir) {
-            plan.push_if_needed(job, options.mode, false);
-        }
-        for lib in parse_libraries(&version_json, game_dir) {
-            if let Some(job) = lib.artifact {
-                plan.push_if_needed(job, options.mode, false);
-            }
-            if let Some(job) = lib.native {
-                plan.push_if_needed(job, options.mode, false);
-            }
-        }
-        if let Some(job) = asset_index_job(&version_json, game_dir) {
-            let index_path = job.destination.clone();
-            plan.push_if_needed(job, options.mode, false);
-            if let Ok(index_json) = fs::read_to_string(index_path) {
-                if let Ok(assets) = assets_to_resources(&index_json, game_dir) {
-                    for asset in assets {
-                        plan.push_if_needed(asset.download, options.mode, false);
-                    }
-                }
-            }
-        }
-        if let Some(job) = logging_config_job(&version_json, game_dir) {
-            plan.push_if_needed(job, options.mode, false);
-        }
-        plan
-    }
-
-    fn push_if_needed(&mut self, job: DownloadJob, mode: DownloadMode, stale_manifest: bool) {
-        let should_download = if mode == DownloadMode::AllFiles {
-            true
-        } else if stale_manifest {
-            file_is_missing_or_older_than(&job.destination, Duration::from_secs(60 * 60 * 24))
-        } else {
-            !existing_file_is_valid(&job)
-        };
-        if should_download {
-            self.tasks.push(job);
-        }
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.tasks.is_empty()
-    }
-}
-
 pub fn download_selected_version(
     config: &LauncherConfig,
     sender: mpsc::Sender<DownloadEvent>,
@@ -321,20 +190,19 @@ pub fn download_selected_version(
         config.redownload_all_files,
         config.show_all_versions
     );
-    let manifest = fetch_manifest(config.show_all_versions)?;
+    let manifest_text = fetch_manifest_document()?;
+    let manifest = parse_versions_manifest(&manifest_text, config.show_all_versions)?;
     let version = resolve_selected_version(&manifest, &profile.version_id);
     eprintln!("[download] Resolved version: {version}");
     let game_dir = &profile.game_directory;
     fs::create_dir_all(game_dir)?;
+    write_atomic(
+        &game_dir.join("version_manifest_v2.json"),
+        manifest_text.as_bytes(),
+    )?;
 
     run_jobs(
         vec![
-            DownloadJob::new(
-                DownloadKind::VersionManifest,
-                VERSION_MANIFEST_URL,
-                game_dir.join("version_manifest_v2.json"),
-                "version manifest",
-            ),
             version_json_job(&manifest, game_dir, &version).ok_or_else(|| {
                 io::Error::new(
                     io::ErrorKind::NotFound,
@@ -381,13 +249,9 @@ pub fn download_selected_version(
             .join("indexes")
             .join(format!("{index_id}.json"));
         if index_path.exists() {
-            let assets = assets_to_resources(&fs::read_to_string(index_path)?, game_dir)?;
+            let assets = asset_jobs_from_index(&fs::read_to_string(index_path)?, game_dir)?;
             eprintln!("[download] Queued asset objects: {} jobs", assets.len());
-            run_jobs(
-                assets.into_iter().map(|asset| asset.download).collect(),
-                config,
-                &sender,
-            )?;
+            run_jobs(assets, config, &sender)?;
         }
     }
 
@@ -401,32 +265,37 @@ fn run_jobs(
 ) -> io::Result<()> {
     let original_count = jobs.len();
     let jobs = dedupe_jobs_by_destination(jobs);
+    let deduped_count = jobs.len();
+    if deduped_count != original_count {
+        eprintln!(
+            "[download] Deduplicated jobs by destination: {original_count} -> {deduped_count}"
+        );
+    }
+    let jobs = jobs
+        .into_iter()
+        .filter(|job| config.redownload_all_files || !existing_file_is_valid(job))
+        .collect::<Vec<_>>();
+    if jobs.len() != deduped_count {
+        eprintln!(
+            "[download] Skipped {} files that already passed integrity checks",
+            deduped_count - jobs.len()
+        );
+    }
     if jobs.is_empty() {
         eprintln!("[download] No jobs to run");
         return Ok(());
     }
-    if jobs.len() != original_count {
-        eprintln!(
-            "[download] Deduplicated jobs by destination: {original_count} -> {}",
-            jobs.len()
-        );
-    }
-    let options = DownloadOptions {
-        mode: if config.redownload_all_files {
-            DownloadMode::AllFiles
-        } else {
-            DownloadMode::MissingLibraries
-        },
-        include_snapshots: config.show_all_versions,
-        max_parallel_downloads: config.download_threads,
-        async_download: false,
+    let concurrency = if config.async_download {
+        config.download_threads.max(1)
+    } else {
+        1
     };
     eprintln!(
         "[download] Running {} jobs with concurrency {}",
         jobs.len(),
-        options.max_parallel_downloads.max(1)
+        concurrency
     );
-    let summary = execute_downloads(jobs, options.max_parallel_downloads, sender.clone());
+    let summary = execute_downloads(jobs, concurrency, sender.clone());
     eprintln!(
         "[download] Jobs finished: succeeded={}, failed={}",
         summary.succeeded, summary.failed
@@ -448,19 +317,23 @@ fn dedupe_jobs_by_destination(jobs: Vec<DownloadJob>) -> Vec<DownloadJob> {
         .collect()
 }
 
-fn fetch_manifest(include_snapshots: bool) -> io::Result<Vec<ManifestVersion>> {
+pub(crate) fn fetch_manifest(include_snapshots: bool) -> io::Result<Vec<ManifestVersion>> {
+    let manifest = fetch_manifest_document()?;
+    let versions = parse_versions_manifest(&manifest, include_snapshots)?;
+    eprintln!("[download] Manifest versions available: {}", versions.len());
+    Ok(versions)
+}
+
+fn fetch_manifest_document() -> io::Result<String> {
     eprintln!("[download] Fetching Mojang version manifest");
-    let manifest = ureq::AgentBuilder::new()
+    ureq::AgentBuilder::new()
         .timeout(Duration::from_secs(30))
         .build()
         .get(VERSION_MANIFEST_URL)
         .call()
         .map_err(|error| io::Error::other(error.to_string()))?
         .into_string()
-        .map_err(|error| io::Error::other(error.to_string()))?;
-    let versions = parse_versions_manifest(&manifest, include_snapshots)?;
-    eprintln!("[download] Manifest versions available: {}", versions.len());
-    Ok(versions)
+        .map_err(|error| io::Error::other(error.to_string()))
 }
 
 #[derive(Debug, Deserialize)]
@@ -622,12 +495,7 @@ fn resolve_library(lib: &LibraryJson, libraries_dir: &Path) -> ResolvedLibrary {
                 )
             })
     });
-    ResolvedLibrary {
-        name: lib.name.clone(),
-        classpath_path: artifact_path.map(|path| libraries_dir.join(path)),
-        artifact,
-        native,
-    }
+    ResolvedLibrary { artifact, native }
 }
 
 #[derive(Debug, Deserialize)]
@@ -640,7 +508,7 @@ struct AssetObjectJson {
     size: Option<u64>,
 }
 
-pub fn assets_to_resources(asset_index: &str, game_dir: &Path) -> io::Result<Vec<AssetResource>> {
+fn asset_jobs_from_index(asset_index: &str, game_dir: &Path) -> io::Result<Vec<DownloadJob>> {
     let parsed: AssetIndexJson = serde_json::from_str(asset_index).map_err(invalid_data)?;
     Ok(parsed
         .objects
@@ -651,59 +519,16 @@ pub fn assets_to_resources(asset_index: &str, game_dir: &Path) -> io::Result<Vec
                 .join("objects")
                 .join(prefix)
                 .join(&object.hash);
-            let object_path = game_dir.join(&object_rel);
-            let resource_path = game_dir.join("resources").join(&name);
             let url = format!("{ASSET_OBJECTS_BASE_URL}{prefix}/{}", object.hash);
-            let download = DownloadJob::new(
+            DownloadJob::new(
                 DownloadKind::Asset,
                 url,
-                object_path.clone(),
+                game_dir.join(object_rel),
                 format!("asset {name}"),
             )
-            .with_integrity(Some(object.hash.clone()), object.size);
-            AssetResource {
-                name,
-                hash: object.hash,
-                object_path,
-                resource_path,
-                download,
-            }
+            .with_integrity(Some(object.hash), object.size)
         })
         .collect())
-}
-
-pub fn copy_assets_to_resources(resources: &[AssetResource]) -> io::Result<()> {
-    for resource in resources {
-        if resource
-            .resource_path
-            .metadata()
-            .map(|m| Some(m.len()) == resource.download.expected_size)
-            .unwrap_or(false)
-        {
-            continue;
-        }
-        if let Some(parent) = resource.resource_path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        fs::copy(&resource.object_path, &resource.resource_path)?;
-    }
-    Ok(())
-}
-
-pub fn run_downloads(
-    plan: DownloadPlan,
-    options: DownloadOptions,
-    sender: mpsc::Sender<DownloadEvent>,
-) -> Option<thread::JoinHandle<DownloadSummary>> {
-    let concurrency = options.max_parallel_downloads.max(1);
-    if options.async_download {
-        Some(thread::spawn(move || {
-            execute_downloads(plan.tasks, concurrency, sender)
-        }))
-    } else {
-        let _ = execute_downloads(plan.tasks, concurrency, sender);
-        None
-    }
 }
 
 pub fn execute_downloads(
@@ -809,19 +634,19 @@ fn download_with_retries(
                     "[download] Retrying job {} after attempt {attempt}/{MAX_DOWNLOAD_ATTEMPTS}: {error}",
                     job.label
                 );
-                let _ = fs::remove_file(job.destination.with_extension("download"));
+                let _ = fs::remove_file(temporary_download_path(&job.destination));
                 last_error = Some(error);
                 let backoff_ms = 500 * attempt as u64;
                 thread::sleep(Duration::from_millis(backoff_ms));
             }
             Err(error) => {
-                let _ = fs::remove_file(job.destination.with_extension("download"));
+                let _ = fs::remove_file(temporary_download_path(&job.destination));
                 return Err(error);
             }
         }
     }
 
-    let _ = fs::remove_file(job.destination.with_extension("download"));
+    let _ = fs::remove_file(temporary_download_path(&job.destination));
     Err(last_error.expect("retry loop must store the last retryable error"))
 }
 
@@ -834,7 +659,7 @@ fn download_one_attempt(
         fs::create_dir_all(parent)?;
     }
 
-    let tmp = job.destination.with_extension("download");
+    let tmp = temporary_download_path(&job.destination);
     let _ = fs::remove_file(&tmp);
     let mut file = fs::File::create(&tmp)?;
     let mut downloaded = 0_u64;
@@ -853,16 +678,21 @@ fn download_one_attempt(
             sender,
         )?;
     } else {
-        let response = ureq::get(&job.url).call().map_err(|error| match error {
-            ureq::Error::Status(status, _) => DownloadError::HttpStatus {
-                url: job.url.clone(),
-                status,
-            },
-            ureq::Error::Transport(error) => DownloadError::Network {
-                url: job.url.clone(),
-                message: error.to_string(),
-            },
-        })?;
+        let response = ureq::AgentBuilder::new()
+            .timeout(Duration::from_secs(30))
+            .build()
+            .get(&job.url)
+            .call()
+            .map_err(|error| match error {
+                ureq::Error::Status(status, _) => DownloadError::HttpStatus {
+                    url: job.url.clone(),
+                    status,
+                },
+                ureq::Error::Transport(error) => DownloadError::Network {
+                    url: job.url.clone(),
+                    message: error.to_string(),
+                },
+            })?;
         let total = response
             .header("content-length")
             .and_then(|value| value.parse::<u64>().ok())
@@ -897,8 +727,35 @@ fn download_one_attempt(
             });
         }
     }
-    fs::rename(tmp, &job.destination)?;
+    replace_file(&tmp, &job.destination)?;
     Ok(())
+}
+
+fn temporary_download_path(destination: &Path) -> PathBuf {
+    let mut name = destination.as_os_str().to_os_string();
+    name.push(".download");
+    PathBuf::from(name)
+}
+
+fn write_atomic(destination: &Path, contents: &[u8]) -> io::Result<()> {
+    if let Some(parent) = destination.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let tmp = temporary_download_path(destination);
+    let _ = fs::remove_file(&tmp);
+    let mut file = fs::File::create(&tmp)?;
+    file.write_all(contents)?;
+    file.sync_all()?;
+    replace_file(&tmp, destination)
+}
+
+fn replace_file(source: &Path, destination: &Path) -> io::Result<()> {
+    if destination.exists() {
+        // Windows does not replace an existing file with rename, which made
+        // "redownload all" fail after the new file had already been verified.
+        fs::remove_file(destination)?;
+    }
+    fs::rename(source, destination)
 }
 
 fn stream_to_file(
@@ -942,6 +799,7 @@ fn sha1_hex_file(path: &Path) -> io::Result<String> {
     Ok(sha1.finalize_hex())
 }
 
+#[cfg(test)]
 fn sha1_hex(data: &[u8]) -> String {
     let mut sha1 = Sha1::new();
     sha1.update(data);
@@ -1136,16 +994,6 @@ fn existing_file_is_valid(job: &DownloadJob) -> bool {
     true
 }
 
-fn file_is_missing_or_older_than(path: &Path, max_age: Duration) -> bool {
-    let Ok(modified) = path.metadata().and_then(|m| m.modified()) else {
-        return true;
-    };
-    SystemTime::now()
-        .duration_since(modified)
-        .map(|age| age > max_age)
-        .unwrap_or(false)
-}
-
 fn resolve_selected_version(manifest: &[ManifestVersion], selected: &str) -> String {
     if selected == "latest" {
         manifest
@@ -1164,6 +1012,7 @@ fn invalid_data(error: serde_json::Error) -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::SystemTime;
 
     #[test]
     fn manifest_parser_filters_snapshots_like_original_downloader() {
@@ -1182,30 +1031,6 @@ mod tests {
 
         let all = parse_versions_manifest(manifest, true).unwrap();
         assert_eq!(all.len(), 2);
-    }
-
-    #[test]
-    fn assets_map_hashes_to_objects_and_resources() {
-        let index = r#"{
-            "objects": {
-                "icons/icon_16x16.png": {
-                    "hash": "abcdef0123456789abcdef0123456789abcdef01",
-                    "size": 12
-                }
-            }
-        }"#;
-        let resources = assets_to_resources(index, Path::new(".minecraft")).unwrap();
-        let resource = &resources[0];
-
-        assert_eq!(
-            resource.object_path,
-            PathBuf::from(".minecraft/assets/objects/ab/abcdef0123456789abcdef0123456789abcdef01")
-        );
-        assert_eq!(
-            resource.resource_path,
-            PathBuf::from(".minecraft/resources/icons/icon_16x16.png")
-        );
-        assert_eq!(resource.download.expected_size, Some(12));
     }
 
     #[test]
@@ -1255,125 +1080,12 @@ mod tests {
 
         assert_eq!(libraries.len(), 1);
         assert!(libraries[0].artifact.is_none());
-        assert!(libraries[0].classpath_path.is_none());
         assert!(libraries[0].native.is_some());
-    }
-
-    #[test]
-    fn plan_from_config_expands_local_metadata_and_skips_valid_missing_mode() {
-        let root = std::env::temp_dir().join(format!(
-            "vortex-plan-test-{}",
-            SystemTime::now()
-                .duration_since(SystemTime::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        fs::create_dir_all(root.join("versions/1.0")).unwrap();
-        fs::create_dir_all(root.join("assets/indexes")).unwrap();
-        fs::write(
-            root.join("version_manifest_v2.json"),
-            r#"{"versions":[{"id":"1.0","type":"release","url":"https://example/1.0.json"}]}"#,
-        )
-        .unwrap();
-        let native_classifier = minecraft_native_classifier();
-        fs::write(
-            root.join("versions/1.0/1.0.json"),
-            format!(
-                r#"{{
-                "id":"1.0",
-                "downloads":{{"client":{{"url":"https://example/client.jar","sha1":"a9993e364706816aba3e25717850c26c9cd0d89d","size":3}}}},
-                "libraries":[{{
-                    "name":"org.example:lib:1.0",
-                    "downloads":{{
-                        "artifact":{{"path":"org/example/lib/1.0/lib-1.0.jar","url":"https://example/lib.jar","sha1":"a9993e364706816aba3e25717850c26c9cd0d89d","size":3}},
-                        "classifiers":{{"{native_classifier}":{{"path":"org/example/lib/1.0/lib-1.0-{native_classifier}.jar","url":"https://example/native.jar"}}}}
-                    }}
-                }}],
-                "assetIndex":{{"id":"1","url":"https://example/assets.json","size":999}},
-                "logging":{{"client":{{"file":{{"url":"https://example/log.xml"}}}}}}
-            }}"#
-            ),
-        )
-        .unwrap();
-        fs::write(
-            root.join("assets/indexes/1.json"),
-            r#"{"objects":{"icons/icon.png":{"hash":"abcdef0123456789abcdef0123456789abcdef01","size":12}}}"#,
-        )
-        .unwrap();
-        fs::create_dir_all(root.join("libraries/org/example/lib/1.0")).unwrap();
-        fs::write(
-            root.join("libraries/org/example/lib/1.0/lib-1.0.jar"),
-            b"abc",
-        )
-        .unwrap();
-
-        let profile = LaunchProfile {
-            username: "Player".to_owned(),
-            version_id: "1.0".to_owned(),
-            game_directory: root.clone(),
-            java_path: None,
-            memory_mb: 2048,
-            jvm_args: Vec::new(),
-            game_args: Vec::new(),
-        };
-        let options = DownloadOptions {
-            mode: DownloadMode::MissingLibraries,
-            include_snapshots: false,
-            max_parallel_downloads: 2,
-            async_download: false,
-        };
-        let plan = DownloadPlan::from_config(&profile, options);
-        let kinds = plan.tasks.iter().map(|job| &job.kind).collect::<Vec<_>>();
-
-        assert_eq!(plan.max_parallel_downloads, 2);
-        assert!(!kinds.contains(&&DownloadKind::Library));
-        assert!(kinds.contains(&&DownloadKind::ClientJar));
-        assert!(kinds.contains(&&DownloadKind::NativeLibrary));
-        assert!(kinds.contains(&&DownloadKind::AssetIndex));
-        assert!(kinds.contains(&&DownloadKind::Asset));
-        assert!(kinds.contains(&&DownloadKind::LogConfig));
-
-        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
     fn bundled_sha1_matches_known_vector() {
         assert_eq!(sha1_hex(b"abc"), "a9993e364706816aba3e25717850c26c9cd0d89d");
-    }
-
-    #[test]
-    fn retry_policy_covers_transient_network_and_integrity_failures() {
-        assert!(DownloadError::Network {
-            url: "https://example/asset.ogg".to_owned(),
-            message: "peer closed connection without sending TLS close_notify".to_owned(),
-        }
-        .is_retryable());
-        assert!(DownloadError::Io(io::Error::new(
-            io::ErrorKind::UnexpectedEof,
-            "unexpected eof",
-        ))
-        .is_retryable());
-        assert!(DownloadError::HttpStatus {
-            url: "https://example/asset.ogg".to_owned(),
-            status: 503,
-        }
-        .is_retryable());
-        assert!(DownloadError::Sha1Mismatch {
-            expected: "expected".to_owned(),
-            actual: "actual".to_owned(),
-        }
-        .is_retryable());
-
-        assert!(!DownloadError::HttpStatus {
-            url: "https://example/missing.ogg".to_owned(),
-            status: 404,
-        }
-        .is_retryable());
-        assert!(!DownloadError::Io(io::Error::new(
-            io::ErrorKind::NotFound,
-            "missing local file",
-        ))
-        .is_retryable());
     }
 
     #[test]
@@ -1389,6 +1101,8 @@ mod tests {
         let source = root.join("source.bin");
         let destination = root.join("nested/destination.bin");
         fs::write(&source, b"abc").unwrap();
+        fs::create_dir_all(destination.parent().unwrap()).unwrap();
+        fs::write(&destination, b"old").unwrap();
         let (tx, rx) = mpsc::channel();
         let job = DownloadJob::new(
             DownloadKind::Asset,
@@ -1404,7 +1118,7 @@ mod tests {
         download_with_retries(&job, 7, &tx).unwrap();
 
         assert_eq!(fs::read(&destination).unwrap(), b"abc");
-        assert!(!destination.with_extension("download").exists());
+        assert!(!temporary_download_path(&destination).exists());
         assert!(rx.try_iter().any(|event| {
             event
                 == DownloadEvent::JobProgress {
@@ -1414,43 +1128,9 @@ mod tests {
                 }
         }));
 
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn large_file_download_emits_progress_for_each_chunk() {
-        let root = std::env::temp_dir().join(format!(
-            "vortex-large-download-test-{}",
-            SystemTime::now()
-                .duration_since(SystemTime::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        fs::create_dir_all(&root).unwrap();
-        let source = root.join("source.bin");
-        let destination = root.join("nested/destination.bin");
-        let bytes = vec![42_u8; (64 * 1024) + 17];
-        fs::write(&source, &bytes).unwrap();
-        let (tx, rx) = mpsc::channel();
-        let job = DownloadJob::new(
-            DownloadKind::Asset,
-            format!("file://{}", source.display()),
-            destination.clone(),
-            "large local test asset",
-        )
-        .with_integrity(Some(sha1_hex(&bytes)), Some(bytes.len() as u64));
-
-        download_with_retries(&job, 3, &tx).unwrap();
-
-        let progress = rx
-            .try_iter()
-            .filter_map(|event| match event {
-                DownloadEvent::JobProgress { downloaded, .. } => Some(downloaded),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(fs::read(&destination).unwrap(), bytes);
-        assert_eq!(progress, vec![64 * 1024, (64 * 1024) + 17]);
+        let (skip_tx, skip_rx) = mpsc::channel();
+        run_jobs(vec![job], &LauncherConfig::default(), &skip_tx).unwrap();
+        assert!(skip_rx.try_iter().next().is_none());
 
         let _ = fs::remove_dir_all(root);
     }

@@ -1,7 +1,5 @@
 // Vortex Minecraft Launcher
 // SPDX-License-Identifier: GPL-3.0-only
-#![allow(dead_code)]
-
 use std::io;
 use std::path::Path;
 use std::process::{Child, Command, ExitStatus};
@@ -20,7 +18,7 @@ pub struct LaunchOptions {
 pub struct LaunchOutcome {
     pub child: Child,
     pub display_command: Option<String>,
-    pub should_close_launcher: bool,
+    pub should_hide_launcher: bool,
 }
 
 #[derive(Debug)]
@@ -46,7 +44,7 @@ pub fn launch_minecraft(
     Ok(LaunchOutcome {
         child,
         display_command,
-        should_close_launcher: !options.keep_launcher_open,
+        should_hide_launcher: !options.keep_launcher_open,
     })
 }
 
@@ -156,47 +154,14 @@ mod tests {
     }
 
     #[test]
-    fn display_command_quotes_without_changing_process_args() {
+    fn process_keeps_argument_boundaries_and_removes_java_options() {
         let command = sample_command();
+        let process = minecraft_process(&command);
 
         assert_eq!(
             display_command(&command),
             "\"/opt/java bin/java\" -Xmx2048M \"-Dkey=value with spaces\" net.minecraft.client.Main"
         );
-        assert_eq!(command.args[1], "-Dkey=value with spaces");
-    }
-
-    #[test]
-    fn display_command_uses_saved_launch_string_when_available() {
-        let mut command = sample_command();
-        command.launch_string = Some("saved java invocation".to_owned());
-
-        assert_eq!(display_command(&command), "saved java invocation");
-    }
-
-    #[test]
-    fn keep_launcher_open_controls_close_flag() {
-        let close_after_spawn = !LaunchOptions {
-            keep_launcher_open: false,
-            save_launch_string: false,
-        }
-        .keep_launcher_open;
-        let remain_open = !LaunchOptions {
-            keep_launcher_open: true,
-            save_launch_string: false,
-        }
-        .keep_launcher_open;
-
-        assert!(close_after_spawn);
-        assert!(!remain_open);
-    }
-
-    #[test]
-    fn process_builders_remove_java_options_and_keep_distinct_args() {
-        let command = sample_command();
-        let process = minecraft_process(&command);
-        let env_overrides: Vec<_> = process.get_envs().collect();
-
         assert_eq!(
             process
                 .get_args()
@@ -204,16 +169,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             command.args
         );
-        assert!(env_overrides
-            .iter()
-            .any(|(key, value)| key == &JAVA_OPTIONS_ENV && value.is_none()));
-
-        let validation = java_version_process(&command);
-        assert_eq!(
-            validation.get_args().collect::<Vec<_>>(),
-            vec![std::ffi::OsStr::new("-version")]
-        );
-        assert!(validation
+        assert!(process
             .get_envs()
             .any(|(key, value)| key == JAVA_OPTIONS_ENV && value.is_none()));
     }

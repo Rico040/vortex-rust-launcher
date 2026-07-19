@@ -14,7 +14,6 @@ mod ui;
 
 use std::fs;
 use std::io;
-use std::process::Command;
 
 fn main() {
     if let Err(error) = run() {
@@ -26,13 +25,7 @@ fn main() {
 fn run() -> io::Result<()> {
     eprintln!("[launcher] Starting Vortex Minecraft Launcher");
     let mut config = match config::LauncherConfig::load_default() {
-        Ok(config) => {
-            eprintln!(
-                "[launcher] Loaded configuration from {}",
-                config::DEFAULT_CONFIG_FILE
-            );
-            config
-        }
+        Ok(config) => config,
         Err(error) => {
             eprintln!(
                 "[launcher] Could not load {}: {error}; using platform defaults",
@@ -54,8 +47,7 @@ fn run() -> io::Result<()> {
                 .or_else(|| config.selected_version.clone())
                 .unwrap_or_else(|| "latest".to_owned());
             eprintln!("[launcher] Command: download {version}");
-            config.selected_version =
-                Some(resolve_latest_alias(&version, config.show_all_versions)?);
+            config.selected_version = Some(version);
             download_selected_version(&config)
         }
         Some("set") => {
@@ -80,8 +72,7 @@ fn run() -> io::Result<()> {
             eprintln!("[launcher] Command: gui");
             let runtime = platform::RuntimeEnvironment::detect();
             let profile = minecraft::LaunchProfile::from_config(&config);
-            let download_plan = download::DownloadPlan::for_profile(&profile);
-            let ui = ui::LauncherUi::new(runtime, config, profile, download_plan);
+            let ui = ui::LauncherUi::new(runtime, config, profile);
             ui.run()
                 .map_err(|error| io::Error::other(error.to_string()))
         }
@@ -146,18 +137,21 @@ fn apply_setting(config: &mut config::LauncherConfig, args: Vec<String>) -> io::
     }
     match args[0].as_str() {
         "name" => config.username = Some(args[1].clone()),
-        "ram" => config.memory_mb = args[1].parse().ok(),
+        "ram" => {
+            let memory_mb = parse_positive_u32("ram", &args[1])?;
+            config.memory_mb = Some(memory_mb);
+        }
         "version" => config.selected_version = Some(args[1].clone()),
         "java" => {
             config.java_path = Some(args[1].clone().into());
             config.use_custom_java = true;
         }
-        "threads" => config.download_threads = args[1].parse().unwrap_or(config.download_threads),
-        "snapshots" => config.show_all_versions = parse_bool(&args[1]),
-        "async-download" => config.async_download = parse_bool(&args[1]),
-        "download-missing-libs" => config.download_missing_libraries = parse_bool(&args[1]),
-        "save-launch-string" => config.save_launch_string = parse_bool(&args[1]),
-        "keep-open" => config.keep_launcher_open = parse_bool(&args[1]),
+        "threads" => config.download_threads = parse_positive_usize("threads", &args[1])?,
+        "snapshots" => config.show_all_versions = parse_bool(&args[1])?,
+        "async-download" => config.async_download = parse_bool(&args[1])?,
+        "download-missing-libs" => config.download_missing_libraries = parse_bool(&args[1])?,
+        "save-launch-string" => config.save_launch_string = parse_bool(&args[1])?,
+        "keep-open" => config.keep_launcher_open = parse_bool(&args[1])?,
         key => {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -169,45 +163,45 @@ fn apply_setting(config: &mut config::LauncherConfig, args: Vec<String>) -> io::
     Ok(())
 }
 
-fn parse_bool(value: &str) -> bool {
-    matches!(value, "1" | "true" | "yes" | "on")
+fn parse_bool(value: &str) -> io::Result<bool> {
+    match value.to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Ok(true),
+        "0" | "false" | "no" | "off" => Ok(false),
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("invalid boolean '{value}'; use true or false"),
+        )),
+    }
 }
 
-fn resolve_latest_alias(version: &str, include_snapshots: bool) -> io::Result<String> {
-    if version != "latest" {
-        return Ok(version.to_owned());
-    }
-    eprintln!("[launcher] Resolving latest version alias; include_snapshots={include_snapshots}");
-    fetch_manifest(include_snapshots)?
-        .into_iter()
-        .next()
-        .map(|v| v.id)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no versions in manifest"))
+fn parse_positive_u32(name: &str, value: &str) -> io::Result<u32> {
+    value
+        .parse::<u32>()
+        .ok()
+        .filter(|value| *value > 0)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{name} must be a positive integer"),
+            )
+        })
+}
+
+fn parse_positive_usize(name: &str, value: &str) -> io::Result<usize> {
+    value
+        .parse::<usize>()
+        .ok()
+        .filter(|value| *value > 0)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{name} must be a positive integer"),
+            )
+        })
 }
 
 fn fetch_manifest(include_snapshots: bool) -> io::Result<Vec<download::ManifestVersion>> {
-    eprintln!("[launcher] Fetching version manifest with curl");
-    let output = Command::new("curl")
-        .args([
-            "--fail",
-            "--location",
-            "--silent",
-            "--show-error",
-            download::VERSION_MANIFEST_URL,
-        ])
-        .output()?;
-    if !output.status.success() {
-        return Err(io::Error::other(format!(
-            "curl failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        )));
-    }
-    let versions = download::parse_versions_manifest(
-        &String::from_utf8_lossy(&output.stdout),
-        include_snapshots,
-    )?;
-    eprintln!("[launcher] Parsed {} manifest versions", versions.len());
-    Ok(versions)
+    download::fetch_manifest(include_snapshots)
 }
 
 fn log_config_summary(config: &config::LauncherConfig) {

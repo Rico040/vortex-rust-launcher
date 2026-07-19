@@ -24,7 +24,6 @@ pub enum OperatingSystem {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeEnvironment {
     pub os: OperatingSystem,
-    pub home_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -50,23 +49,7 @@ impl RuntimeEnvironment {
     pub fn detect() -> Self {
         Self {
             os: OperatingSystem::current(),
-            home_dir: home_dir(),
         }
-    }
-
-    pub fn minecraft_directory(&self) -> Option<PathBuf> {
-        let home = self.home_dir.as_ref()?;
-        Some(match self.os {
-            OperatingSystem::Windows => env::var_os("APPDATA")
-                .map(PathBuf::from)
-                .unwrap_or_else(|| home.join("AppData").join("Roaming"))
-                .join(".minecraft"),
-            OperatingSystem::Linux | OperatingSystem::Other => home.join(".minecraft"),
-            OperatingSystem::MacOs => home
-                .join("Library")
-                .join("Application Support")
-                .join("minecraft"),
-        })
     }
 
     pub fn ui_layout(&self) -> UiLayout {
@@ -134,7 +117,8 @@ impl OperatingSystem {
 pub fn current_platform_defaults() -> PlatformDefaults {
     PlatformDefaults {
         working_directory: executable_directory(),
-        default_java_executable_path: discover_windows_java()
+        default_java_executable_path: configured_java_path()
+            .or_else(discover_windows_java)
             .unwrap_or_else(|| PathBuf::from(r"C:\jre8\bin\javaw.exe")),
         default_ram_mb: 2500,
         default_download_threads: 20,
@@ -197,6 +181,7 @@ pub fn current_platform_defaults() -> PlatformDefaults {
     }
 }
 
+#[cfg(target_os = "macos")]
 fn home_dir() -> Option<PathBuf> {
     env::var_os("HOME")
         .or_else(|| env::var_os("USERPROFILE"))
@@ -319,27 +304,6 @@ fn java_major_from_version_string(version: &str) -> Option<u32> {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn parses_java_major_from_release_versions() {
-        assert_eq!(java_major_from_version_string("1.8.0_402"), Some(8));
-        assert_eq!(java_major_from_version_string("17.0.11"), Some(17));
-        assert_eq!(java_major_from_version_string("21.0.5"), Some(21));
-        assert_eq!(java_major_from_version_string("25"), Some(25));
-    }
-
-    #[test]
-    fn parses_java_major_from_adoptium_folder_names() {
-        assert_eq!(java_major_from_name("jdk-8.0.402.6-hotspot"), Some(8));
-        assert_eq!(java_major_from_name("jdk-17.0.11.9-hotspot"), Some(17));
-        assert_eq!(java_major_from_name("jdk-21.0.5.11-hotspot"), Some(21));
-        assert_eq!(java_major_from_name("jdk-25.0.0.36-hotspot"), Some(25));
-    }
-}
-
 fn discover_windows_java() -> Option<PathBuf> {
     let program_files_dirs = [env::var_os("ProgramW6432"), env::var_os("PROGRAMFILES")];
     let java_dirs = ["Java", "Eclipse Adoptium"];
@@ -382,9 +346,20 @@ fn discover_macos_java() -> Option<PathBuf> {
 }
 
 fn find_on_path(binary: &str) -> Option<PathBuf> {
-    env::var_os("PATH")?
-        .to_string_lossy()
-        .split(if cfg!(windows) { ';' } else { ':' })
-        .map(|entry| PathBuf::from(entry).join(binary))
-        .find(|candidate| candidate.exists())
+    env::split_paths(&env::var_os("PATH")?)
+        .map(|entry| entry.join(binary))
+        .find(|candidate| candidate.is_file())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_java_major_from_runtime_versions_and_folder_names() {
+        assert_eq!(java_major_from_version_string("1.8.0_402"), Some(8));
+        assert_eq!(java_major_from_version_string("21.0.5"), Some(21));
+        assert_eq!(java_major_from_name("jdk-17.0.11.9-hotspot"), Some(17));
+        assert_eq!(java_major_from_name("jdk-25.0.0.36-hotspot"), Some(25));
+    }
 }

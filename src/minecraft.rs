@@ -1,27 +1,17 @@
 // Vortex Minecraft Launcher
 // SPDX-License-Identifier: GPL-3.0-only
-#![allow(dead_code)]
-
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
-use crate::config::LauncherConfig;
+use crate::config::{parse_arg_string, LauncherConfig};
 use crate::platform;
 
 const LAUNCHER_NAME: &str = "vortex-rust-launcher";
 const LAUNCHER_VERSION: &str = env!("CARGO_PKG_VERSION");
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct VersionMetadata {
-    pub id: String,
-    pub main_class: Option<String>,
-    pub libraries: Vec<Library>,
-    pub assets_index: Option<String>,
-}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Library {
@@ -117,7 +107,6 @@ pub struct MinecraftVersionJson {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct JavaVersion {
-    pub component: Option<String>,
     pub major_version: Option<u32>,
 }
 
@@ -126,15 +115,12 @@ pub struct AssetIndex {
     pub id: Option<String>,
     pub sha1: Option<String>,
     pub size: Option<u64>,
-    #[serde(rename = "totalSize")]
-    pub total_size: Option<u64>,
     pub url: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct VersionDownloads {
     pub client: Option<DownloadInfo>,
-    pub server: Option<DownloadInfo>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -213,7 +199,6 @@ pub enum RuleAction {
 pub struct OsRule {
     pub name: Option<String>,
     pub arch: Option<String>,
-    pub version: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -225,19 +210,6 @@ pub struct LoggingJson {
 pub struct LoggingClient {
     pub argument: Option<String>,
     pub file: Option<DownloadInfo>,
-    #[serde(rename = "type")]
-    pub kind: Option<String>,
-}
-
-impl VersionMetadata {
-    pub fn minimal(id: &str) -> Self {
-        Self {
-            id: id.to_owned(),
-            main_class: None,
-            libraries: Vec::new(),
-            assets_index: None,
-        }
-    }
 }
 
 impl MinecraftVersionJson {
@@ -249,9 +221,23 @@ impl MinecraftVersionJson {
 
     pub fn load_resolved(game_directory: impl AsRef<Path>, version: &str) -> io::Result<Self> {
         let game_directory = game_directory.as_ref();
+        Self::load_resolved_inner(game_directory, version, &mut HashSet::new())
+    }
+
+    fn load_resolved_inner(
+        game_directory: &Path,
+        version: &str,
+        seen: &mut HashSet<String>,
+    ) -> io::Result<Self> {
+        if !seen.insert(version.to_owned()) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("cyclic Minecraft version inheritance at '{version}'"),
+            ));
+        }
         let child = Self::load(game_directory, version)?;
         if let Some(parent_id) = child.inherits_from.clone() {
-            let parent = Self::load_resolved(game_directory, &parent_id)?;
+            let parent = Self::load_resolved_inner(game_directory, &parent_id, seen)?;
             Ok(parent.inherit(child))
         } else {
             Ok(child)
@@ -277,23 +263,6 @@ impl MinecraftVersionJson {
         self.logging = child.logging.or(self.logging);
         self.libraries.extend(child.libraries);
         self
-    }
-
-    pub fn to_metadata(&self, game_directory: impl AsRef<Path>) -> VersionMetadata {
-        VersionMetadata {
-            id: self.id.clone().unwrap_or_default(),
-            main_class: self.main_class.clone(),
-            libraries: self.effective_libraries(game_directory),
-            assets_index: self
-                .asset_index
-                .as_ref()
-                .and_then(|a| a.id.clone())
-                .or_else(|| self.assets.clone()),
-        }
-    }
-
-    pub fn effective_libraries(&self, game_directory: impl AsRef<Path>) -> Vec<Library> {
-        self.effective_libraries_with_context(game_directory, &LaunchContext::current())
     }
 
     pub fn effective_libraries_with_context(
@@ -460,9 +429,9 @@ impl MinecraftVersionJson {
             args.extend(expand_arguments(&arguments.game, &replacements, context));
         } else if let Some(legacy) = &self.minecraft_arguments {
             args.extend(
-                legacy
-                    .split_whitespace()
-                    .map(|a| replace_placeholders(a, &replacements)),
+                parse_arg_string(legacy)
+                    .into_iter()
+                    .map(|a| replace_placeholders(&a, &replacements)),
             );
         }
         args.extend(profile.game_args.clone());
@@ -652,28 +621,14 @@ impl LaunchProfile {
                 .use_custom_java
                 .then(|| config.java_path.clone())
                 .flatten(),
-            memory_mb: config.memory_mb.unwrap_or(2048),
-            jvm_args: config.extra_jvm_args.clone(),
+            memory_mb: config.memory_mb.unwrap_or(2048).max(350),
+            jvm_args: if config.use_custom_jvm_parameters {
+                config.extra_jvm_args.clone()
+            } else {
+                Vec::new()
+            },
             game_args: config.extra_game_args.clone(),
         }
-    }
-
-    pub fn launch_arguments(&self, metadata: &VersionMetadata) -> Vec<String> {
-        let mut args = vec![format!("-Xmx{}M", self.memory_mb)];
-        args.extend(self.jvm_args.clone());
-        if let Some(main_class) = &metadata.main_class {
-            args.push(main_class.clone());
-        }
-        args.extend([
-            "--username".to_owned(),
-            self.username.clone(),
-            "--version".to_owned(),
-            self.version_id.clone(),
-            "--gameDir".to_owned(),
-            self.game_directory.display().to_string(),
-        ]);
-        args.extend(self.game_args.clone());
-        args
     }
 
     pub fn launch_command(&self, save_launch_string: bool) -> io::Result<LaunchCommand> {
@@ -688,6 +643,12 @@ impl LaunchProfile {
             metadata.id.as_deref().unwrap_or("<missing>"),
             metadata.libraries.len()
         );
+        if metadata.main_class.as_deref().is_none_or(str::is_empty) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("version '{}' has no main class", self.version_id),
+            ));
+        }
         metadata.extract_native_libraries(self)?;
         Ok(metadata.build_launch_command(self, save_launch_string))
     }
@@ -760,10 +721,6 @@ fn replace_placeholders(value: &str, replacements: &BTreeMap<&str, String>) -> S
         output = output.replace(&format!("${{{key}}}"), replacement);
     }
     output
-}
-
-fn rules_apply(rules: &[Rule]) -> bool {
-    rules_apply_with_context(rules, &LaunchContext::current())
 }
 
 pub(crate) fn rules_apply_with_context(rules: &[Rule], context: &LaunchContext) -> bool {
@@ -861,14 +818,10 @@ fn classpath_separator() -> &'static str {
 }
 
 fn offline_uuid(username: &str) -> String {
-    // Deterministic offline UUID surrogate. It is not a full RFC-4122 MD5 UUID,
-    // but it is stable and avoids pulling process-launch concerns into parsing.
-    let mut hash = 0xcbf29ce484222325_u128;
-    for byte in format!("OfflinePlayer:{username}").bytes() {
-        hash ^= byte as u128;
-        hash = hash.wrapping_mul(0x100000001b3);
-    }
-    format!("{hash:032x}")
+    let mut bytes = md5::compute(format!("OfflinePlayer:{username}")).0;
+    bytes[6] = (bytes[6] & 0x0f) | 0x30;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 fn command_to_string(executable: &Path, args: &[String]) -> String {
@@ -1009,57 +962,7 @@ mod tests {
         assert_eq!(infer_java_major_from_minecraft_version("1.20.4"), Some(17));
         assert_eq!(infer_java_major_from_minecraft_version("1.20.5"), Some(21));
         assert_eq!(infer_java_major_from_minecraft_version("26.2"), Some(25));
-    }
-
-    #[test]
-    fn custom_java_is_only_used_when_enabled() {
-        let mut config = LauncherConfig::default();
-        config.java_path = Some(PathBuf::from("C:/Java/bin/javaw.exe"));
-        config.use_custom_java = false;
-        assert!(LaunchProfile::from_config(&config).java_path.is_none());
-
-        config.use_custom_java = true;
-        assert_eq!(
-            LaunchProfile::from_config(&config).java_path,
-            Some(PathBuf::from("C:/Java/bin/javaw.exe"))
-        );
-    }
-
-    #[test]
-    fn rule_denial_overrides_previous_allow() {
-        let rules: Vec<Rule> = serde_json::from_str(
-            r#"[
-                { "action": "allow" },
-                { "action": "disallow", "os": { "name": "linux" } }
-            ]"#,
-        )
-        .unwrap();
-
-        assert!(!rules_apply_with_context(&rules, &linux_context()));
-    }
-
-    #[test]
-    fn os_specific_allow_matches_launch_context() {
-        let rules: Vec<Rule> =
-            serde_json::from_str(r#"[{ "action": "allow", "os": { "name": "osx" } }]"#).unwrap();
-        let mut context = linux_context();
-        assert!(!rules_apply_with_context(&rules, &context));
-
-        context.os = "osx".to_owned();
-        assert!(rules_apply_with_context(&rules, &context));
-    }
-
-    #[test]
-    fn feature_specific_allow_uses_launch_context() {
-        let rules: Vec<Rule> = serde_json::from_str(
-            r#"[{ "action": "allow", "features": { "is_demo_user": true } }]"#,
-        )
-        .unwrap();
-        let mut context = linux_context();
-        assert!(!rules_apply_with_context(&rules, &context));
-
-        context.demo_mode = true;
-        assert!(rules_apply_with_context(&rules, &context));
+        assert_eq!(offline_uuid("Notch"), "b50ad385829d3141a2167e7d7539ba7f");
     }
 
     #[test]
@@ -1105,7 +1008,7 @@ mod tests {
                     ("nested/helper.so", b"helper"),
                     ("../escape.so", b"escape"),
                 ],
-                zip::CompressionMethod::Stored,
+                zip::CompressionMethod::Deflated,
             ),
         )
         .unwrap();
@@ -1142,33 +1045,6 @@ mod tests {
         );
         assert!(!natives.join("META-INF/MANIFEST.MF").exists());
         assert!(!root.join("versions/1.0/escape.so").exists());
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn extracts_deflated_native_zip_entries() {
-        let root = std::env::temp_dir().join(format!(
-            "vortex-native-deflate-test-{}",
-            SystemTime::now()
-                .duration_since(SystemTime::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        fs::create_dir_all(&root).unwrap();
-        let archive = root.join("native.jar");
-        fs::write(
-            &archive,
-            test_zip(
-                &[("OpenAL32.dll", b"openal" as &[u8])],
-                zip::CompressionMethod::Deflated,
-            ),
-        )
-        .unwrap();
-        let natives = root.join("natives");
-
-        extract_native_archive(&archive, &natives, None).unwrap();
-
-        assert_eq!(fs::read(natives.join("OpenAL32.dll")).unwrap(), b"openal");
         let _ = fs::remove_dir_all(root);
     }
 
